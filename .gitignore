@@ -1,0 +1,34 @@
+# Python caches / build
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Test / tooling caches
+.pytest_cache/
+.benchmarks/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local scratch (compute outputs live under /zfsauton/scratch, never in-repo)
+*.out
+*.log
+
+# Local API key files (read by pilot/stage0/envload.py) -- never commit
+agent/openai_api
+agent/*_api

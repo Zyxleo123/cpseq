@@ -1,0 +1,75 @@
+let's keep trying stuff that somehow make llm pick mutation that improves binding since we're not sure if the current one can score well. Maybe we can try more rounds, more search etc.
+Again, let's make sure our approach is grounded in related work, not necessarily copied but informed
+1:48 AM
+Good instinct to ground this first — iterative/search LLM optimization is a well-studied pattern, and the single-shot seqmut we have is the weakest version of it. Let me confirm the related work (we already have Wang et al. and StructEvo in depth; I want to check the iterative-loop and search-strategy specifics and any peers) before proposing what to build.
+
+
+
+Web SearchLLM directed evolution protein iterative rounds feedback fitness optimizer population selection 2025
+OUT
+Web search results for query: "LLM directed evolution protein iterative rounds feedback fitness optimizer population selection 2025"
+
+Links: [{"title":"[Literature Review] Large Language Model is Secretly a Protein Sequence Optimizer","url":"https://www.themoonlight.io/en/review/large-language-model-is-secretly-a-protein-sequence-optimizer"},{"title":"Advances in Machine Learning for Directed Evolution: A Five-Year Retrospective","url":"https://arxiv.org/pdf/2609.03046"},{"title":"(PDF) An Iterative Deep Learning-Guided Algorithm for Directed Protein Evolution","url":"https://www.researchgate.net/publication/394505367_An_Iterative_Deep_Learning-Guided_Algorithm_for_Directed_Protein_Evolution"},{"title":"[2501.09274] Large Language Model is Secretly a Protein Sequence Optimizer","url":"https://arxiv.org/abs/2501.09274"},{"title":"Rapid in silico directed evolution by a protein language model with EVOLVEpro","url":"https://www.science.org/doi/10.1126/science.adr6006"},{"title":"Active learning-assisted directed evolution","url":"https://www.nature.com/articles/s41467-025-55987-8"},{"title":"An iterative deep learning-guided algorithm for directed protein evolution - ScienceDirect","url":"https://www.sciencedirect.com/science/article/pii/S2589004225015858"},{"title":"GitHub - HySonLab/Directed_Evolution: Protein Design by Machine Learning guided Directed Evolution · GitHub","url":"https://github.com/HySonLab/Directed_Evolution"},{"title":"Large Language Model is Secretly a Protein Sequence Optimizer · Pith Review","url":"https://pith.science/paper/2501.09274"}]
+
+The closest match to your query is **"Large Language Model is Secretly a Protein Sequence Optimizer"** (arXiv 2501.09274, January 2025). The authors report that large language models, despite being trained on massive texts, are secretly protein sequence optimizers. Per a secondary review, the method uses Llama-3.1-8B-Instruct to propose new protein variants from pairs of parent sequences, after which the population is rank-selected by fitness. The paper reports that these proposals beat a random-mutation/crossover evolutionary algorithm on fixed fitness oracles, including DMS ground truth, SLIP, and ML fitness models (per the same review). The arXiv abstract also describes success on synthetic and experimental fitness landscapes. I did not verify the full paper, so the details above come from the abstract and a third-party summary.
+
+Related iterative, model-guided directed evolution work from 2025 includes:
+- **DeepDE:** a supervised deep learning approach that reported a remarkable 74.3-fold increase in activity over four rounds of evolution on GFP.
+- **ALDE:** an iterative machine learning-assisted DE workflow that uses uncertainty quantification. In wet-lab work it raised a cyclopropanation product yield from 12% to 93% over three rounds.
+- **EVOLVEpro:** a protein language model with a lightweight random forest that can optimize multiple protein properties simultaneously during iterative rounds of testing with as few as 10 experimental data points per round.
+
+I did not find a peer-reviewed venue listing for the LLM-guided paper, and the search surfaced no other LLM-specific directed evolution papers from 2025 beyond a GitHub repo and BibTeX entry titled "Protein Design by Directed Evolution Guided by Large Language Models" (2025).
+
+
+REMINDER: You MUST include the sources above in your response to the user using markdown hyperlinks.
+Web SearchLLM optimizer OPRO iterative refinement best-of-N sampling Reflexion self-refine search trajectory feedback
+OUT
+Web search results for query: "LLM optimizer OPRO iterative refinement best-of-N sampling Reflexion self-refine search trajectory feedback"
+
+Links: [{"title":"Self-Refine: Iterative Refinement with Self-Feedback","url":"https://arxiv.org/pdf/2303.17651"},{"title":"Self-Convinced Prompting: Few-Shot Question Answering with Repeated Introspection","url":"https://arxiv.org/pdf/2310.05035"},{"title":"arxiv.org","url":"https://arxiv.org/pdf/2303.17651v1.pdf"},{"title":"what is reflection tuning 2026","url":"https://futureagi.com/blog/what-is-reflection-tuning-2026/"},{"title":"How Many Tries Does It Take? Iterative Self-Repair","url":"https://www.alphaxiv.org/abs/2604.10508.md"},{"title":"Self-Refine Is An Iterative Refinement Loop For LLMs","url":"https://cobusgreyling.substack.com/p/self-refine-is-an-iterative-refinement"},{"title":"# REF-015: Self-Refine - Iterative Refinement with Self-Feedback","url":"https://cdn.jsdelivr.net/npm/aiwg@2026.7.12/docs/references/REF-015-self-refine-iterative-refinement.md"},{"title":"Self-Refine: Iterative Refinement with Self-Feedback","url":"https://notesbylex.com/self-refine-iterative-refinement-with-self-feedback"},{"title":"91edff07232fb1b55a505a9e9f6c0ff3 Supplemental Conference","url":"https://papers.neurips.cc/paper_files/paper/2023/file/91edff07232fb1b55a505a9e9f6c0ff3-Supplemental-Conference.pdf"},{"title":"r/MachineLearning Apr 28 '24","url":"https://redlib.hbubli.cc/r/MachineLearning/comments/1cfb2l5/d_selfrefine_vs_reflexion_which_method_is_better"}]
+
+The search returned good coverage of Self-Refine and Reflexion, but almost nothing on OPRO, best-of-N sampling, or search-trajectory feedback.
+
+**Self-Refine:** The main idea is to generate an output using an LLM, then allow the same model to provide multi-aspect feedback for its own output; finally, the same model refines its previously generated output given its own feedback. It needs no supervised data or RL, and outputs were preferred by humans and automatic metrics over one-step generation, improving by about 20% absolute on average in task performance.
+
+**Reflexion:** Per one source, by employing a binary reward model, Reflexion equips agents with dynamic memory and self-reflection capabilities. Another source says after each attempt, the verbal critique is appended to a memory buffer that primes future attempts at the same task type.
+
+**Key difference:** Self-Refine's loop operates within one task attempt, while Reflexion works across multiple task attempts.
+
+**Not covered in results:** OPRO (LLM-as-optimizer over prompts), best-of-N sampling, and search-trajectory feedback did not appear in the results. A follow-up search targeting those specifically would be needed.
+
+
+REMINDER: You MUST include the sources above in your response to the user using markdown hyperlinks.
+Web Searchlanguage model crossover recombination protein sequence beneficial mutations evolutionary operator
+OUT
+Web search results for query: "language model crossover recombination protein sequence beneficial mutations evolutionary operator"
+
+Links: [{"title":"camp combinatorial engineering of proteins","url":"https://www.media.mit.edu/publications/camp-combinatorial-engineering-of-proteins/"},{"title":"iclr.cc","url":"https://iclr.cc/virtual/2025/34639"},{"title":"camp combinatorial engineering of proteins","url":"https://www-prod.media.mit.edu/publications/camp-combinatorial-engineering-of-proteins/"},{"title":"# Language Model Crossover:","url":"https://arxiv.org/pdf/2302.12170v3.pdf"},{"title":"LanguageModelCrossover TELO24","url":"https://www.kmjn.org/publications/LanguageModelCrossover_TELO24.pdf"},{"title":"www.cognizant.com","url":"https://www.cognizant.com/us/en/ai-lab/blog/lmx"},{"title":"Camp: Combinatorial Engineering of Proteins","url":"https://mlanthology.org/iclrw/2025/ponnapati2025iclrw-camp"},{"title":"## Introduction and Problem Statement","url":"https://chatpaper.com/paper/100837"},{"title":"arxiv.org","url":"https://arxiv.org/pdf/2302.12170v2.pdf"},{"title":"Language Model Crossover:","url":"https://arxiv.org/html/2302.12170v3"}]
+
+The search turned up two main lines of work: a protein-specific method and a general-purpose operator.
+
+**Protein recombination (CAMP):** A 2025 ICLR workshop paper by Ponnapati and colleagues uses a protein language model to pick where to split and recombine protein sequences. The versions I found describe the signal differently. One says log likelihood in the language model is represented as a spline, and another says attention in the language model. Either way, the sharp transitions in that spline mark candidate crossover points. The method then uses these sites to guide recombination of sequence blocks from evolutionarily related sequences using MCMC sampling. The authors also report that these sites also correlate with transitions between various secondary structure elements in the corresponding protein structure. I did not find results on beneficial mutations specifically.
+
+**General language model crossover (LMX):** Meyerson, Lehman and colleagues use a pretrained LLM as a recombination operator in evolutionary search. Parent genotypes are placed in a few-shot prompt, and the model's output serves as offspring. The paper's ACM TELO version reports that language model crossover is a flexible and effective method for evolving genomes representable as text. Its experiments cover bit-strings, sentences, equations, and code, but not proteins.
+
+**Protein-specific LLM evolution:** A third result describes using pretrained LLMs, without fine-tuning, to propose protein variants through mutation and crossover. It reports that LLM-guided evolution consistently outperforms classical evolutionary algorithms (EA) in efficiency and effectiveness. I could not verify this study's source or authors, so treat it as lower confidence.
+
+
+REMINDER: You MUST include the sources above in your response to the user using markdown hyperlinks.
+1:50 AM
+I now have solid grounding. Here's the synthesis before I build — because the related work changes what we build and, critically, what baseline makes a win real.
+
+The current seqmut is single-shot — which the literature says is the weakest form. Every working LLM-sequence-optimizer is iterative with feedback:
+
+Wang et al. 2501.09274 ("LLM is Secretly a Protein Sequence Optimizer") — the direct template: a population of variants, each round the LLM proposes new ones (mutation or crossover) conditioned on the shown fitnesses, elitist-select top-K, 4–16 rounds, Hamming-budget cap. Beats a random-operator EA especially on nonlinear landscapes.
+StructEvo and active-learning DE (EVOLVEpro, ALDE — 12%→93% in 3 rounds): a cheap proxy drives the loop, the expensive oracle only scores finalists.
+Reflexion/Self-Refine — refine across/within attempts via verbal self-feedback (~20% gains); this is literally the project's arm-5 reflection.
+LMX / CAMP (ICLR-W 2025) — LLM as a recombination (crossover) operator.
+What this tells us to build, grounded:
+
+Iterative directed evolution with the LLM as the mutation operator (Wang): population + per-round fitness feedback + elitist selection + Hamming≤k_mut. This is your "more rounds / more search."
+Two-tier fitness (StructEvo/ALDE): the cheap pose-preserving scan drives the loop; Boltz validates only the final winner. Makes rounds affordable.
+Crossover (Wang/LMX) and reflection (Reflexion) as ablatable operators — and reflection is already your arm-5, so it stays in the paper's frame.
+The control the grounding forces (don't skip this): more rounds helps even random search, so a win must beat an iterative random-operator EA at matched rounds/population/budget — exactly Wang's baseline, and exactly this project's "beat the rule at matched compute" principle. Without it, "iterative LLM improves binding" is confounded with "we just searched more."
+
+Let me build the iterative loop into seqmut, with the mat
