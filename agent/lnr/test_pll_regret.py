@@ -215,3 +215,49 @@ def test_report_names_targets_where_the_action_space_binds(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "action space binds on 1/2: a" in out
     assert "bound, not a failure" in out
+
+
+# --- exclusion --------------------------------------------------------------
+def test_load_drops_excluded_targets_everywhere(tmp_path):
+    """Exclusion happens in `load`, not per table, so every statistic
+    downstream sees the same n. A target dropped from the correlations but kept
+    in the solve rate would make two numbers in one report disagree."""
+    rows = [_row("keep1", 8, 0.0), _row("drop", 18, 0.5), _row("keep2", 9, 0.1)]
+    p = _write(tmp_path / "x", rows)
+    assert len(PR.load(p)) == 3
+    kept = PR.load(p, exclude={"drop"})
+    assert [r["target_id"] for r in kept] == ["keep1", "keep2"]
+    # and an id that is not present is simply inert, not an error
+    assert len(PR.load(p, exclude={"nosuchtarget"})) == 3
+
+
+def test_artifact_targets_names_why_not_just_which():
+    """The curated set must carry its reason: a bare id list invites someone to
+    drop a target because it is inconvenient. 5a29's peptide is an expression
+    tag, which is a statement about the DATA, not about the result."""
+    assert "5a29" in PR.ARTIFACT_TARGETS
+    why = PR.ARTIFACT_TARGETS["5a29"]
+    assert "tag" in why.lower() and "LVPRGS" in why
+
+
+def test_exclusion_is_reported_and_changes_n(tmp_path, capsys):
+    """An excluded target is printed, never silent -- a reader comparing two
+    reports has to be able to see which set each one is over."""
+    rows = [_row("5a29", 18, 0.5), _row("keep1", 8, 0.0), _row("keep2", 9, 0.1)]
+    p = _write(tmp_path / "y", rows)
+    assert PR.report(p, exclude={"5a29"}) == 0
+    out = capsys.readouterr().out
+    assert "EXCLUDED 5a29" in out
+    assert "tag" in out.lower()
+    assert "rows: 2" in out
+
+
+def test_compare_excludes_from_the_shared_set(tmp_path):
+    """The paired comparison must not quietly re-admit an excluded target via
+    the shared-target intersection."""
+    a = _write(tmp_path / "a", [_row("5a29", 18, 0.5), _row("t1", 8, 0.2)])
+    b = _write(tmp_path / "b", [_row("5a29", 18, 0.1), _row("t1", 8, 0.0)])
+    out = PR.compare(a, b, exclude={"5a29"})
+    ids = {t for t in (out.get("better") or [])} | {t for t in (out.get("worse") or [])}
+    assert "5a29" not in ids
+    assert out["n_shared"] == 1

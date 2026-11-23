@@ -40,6 +40,22 @@ for _p in (str(_HERE.parent),):
 LENGTH_BINS = ((0, 8), (9, 11), (12, 14), (15, 19), (20, 10**6))
 DISCRIMINATING_REGRET = 0.05
 
+# Peptides that are PURIFICATION ARTIFACTS rather than binders. Optimising a
+# pose-conditioned likelihood over an expression tag measures the tag: a
+# low-complexity repeat has no binding signal to recover, so its regret is not
+# evidence about an operator. Excluded from headline claims via
+# --exclude-artifacts, and reported as a separate line rather than dropped
+# silently, so the n always reconciles.
+#
+# Audited across all 85 selftest-indexable targets (the native sequences
+# printed by job 119637): 5a29 is the ONLY one. It is in the 29-target
+# discriminating subset, so it carries ~3.4% of the graded weight -- small, but
+# it is also L=18, which puts it in the longest bin where the length effect is
+# measured.
+ARTIFACT_TARGETS = {
+    "5a29": "His7 tag + thrombin cleavage site LVPRGS (HHHHHHHSSGLVPRGSHA)",
+}
+
 
 # ---------------------------------------------------------------------------
 # statistics
@@ -93,9 +109,15 @@ def perm_p(a, b, n=20000, seed=0):
 # ---------------------------------------------------------------------------
 # the rows
 # ---------------------------------------------------------------------------
-def load(path, arm=None):
+def load(path, arm=None, exclude=None):
     """Graded rows from a seqmut-iter pll rows file: those carrying BOTH a regret
-    and the optimum it was measured against."""
+    and the optimum it was measured against.
+
+    `exclude` drops target_ids outright (see ARTIFACT_TARGETS). It is applied
+    here rather than in each table so that every statistic, correlation and
+    paired comparison downstream sees the same n.
+    """
+    drop = set(exclude or ())
     out = []
     for line in Path(path).read_text().splitlines():
         if not line.strip():
@@ -110,6 +132,8 @@ def load(path, arm=None):
         if not it.get("optimum"):
             continue
         if arm and r.get("mut_arm") != arm:
+            continue
+        if r.get("target_id") in drop:
             continue
         o = it["optimum"]
         gain = abs(float(o["fitness"]) - float(o["wt_fitness"]))
@@ -131,8 +155,8 @@ def load(path, arm=None):
     return out
 
 
-def arms(path):
-    return sorted({r["arm"] for r in load(path)})
+def arms(path, exclude=None):
+    return sorted({r["arm"] for r in load(path, exclude=exclude)})
 
 
 # ---------------------------------------------------------------------------
@@ -202,15 +226,21 @@ def budget_check(rows, max_evals=None):
 # report
 # ---------------------------------------------------------------------------
 def report(path, out_json=None, thresh=DISCRIMINATING_REGRET, n_perm=20000,
-           max_evals=None, arm=None):
-    rows = load(path, arm=arm)
+           max_evals=None, arm=None, exclude=None):
+    rows = load(path, arm=arm, exclude=exclude)
     if not rows:
         print(f"GATE: no graded rows in {path} (need iter.regret + iter.optimum)")
         return 1
     summary = {"source": str(path), "n": len(rows),
-               "arms": sorted({r["arm"] for r in rows})}
+               "arms": sorted({r["arm"] for r in rows}),
+               "excluded": sorted(exclude or ())}
     print(f"PLL REGRET -- {path}")
     print(f"rows: {len(rows)}   arms: {', '.join(summary['arms'])}")
+    # Printed, never silent: an excluded target changes every n below it, and a
+    # reader comparing two reports needs to see which set each one is over.
+    for t in summary["excluded"]:
+        why = ARTIFACT_TARGETS.get(t, "excluded by request")
+        print(f"  EXCLUDED {t}: {why}")
 
     for a in summary["arms"]:
         g = [r for r in rows if r["arm"] == a]
@@ -285,7 +315,7 @@ def report(path, out_json=None, thresh=DISCRIMINATING_REGRET, n_perm=20000,
     return 0
 
 
-def compare(path_a, path_b, label_a="A", label_b="B", arm=None):
+def compare(path_a, path_b, label_a="A", label_b="B", arm=None, exclude=None):
     """PAIRED comparison of two runs over their SHARED targets.
 
     Written for one question: is a solve rate below 100% a BUDGET limit, a
@@ -299,8 +329,8 @@ def compare(path_a, path_b, label_a="A", label_b="B", arm=None):
     uninformative: a run where 74 of 79 targets are bit-identical and 5 improved
     has not "improved by 0.012 nats on average", it has moved 5 targets.
     """
-    A = {r["target_id"]: r for r in load(path_a, arm=arm)}
-    B = {r["target_id"]: r for r in load(path_b, arm=arm)}
+    A = {r["target_id"]: r for r in load(path_a, arm=arm, exclude=exclude)}
+    B = {r["target_id"]: r for r in load(path_b, arm=arm, exclude=exclude)}
     shared = sorted(set(A) & set(B))
     if not shared:
         print(f"GATE: no shared targets between {path_a} and {path_b}")
@@ -366,13 +396,24 @@ def main() -> int:
                          "operator's ceiling)")
     ap.add_argument("--label", default="run A")
     ap.add_argument("--compare-label", default="run B")
+    ap.add_argument("--exclude", default="",
+                    help="comma-separated target_ids to drop from every table, "
+                         "correlation and paired comparison")
+    ap.add_argument("--exclude-artifacts", action="store_true",
+                    help=f"also drop the curated purification-tag targets "
+                         f"({', '.join(sorted(ARTIFACT_TARGETS))}): peptides "
+                         f"that are expression tags, where there is no binding "
+                         f"signal to recover")
     a = ap.parse_args()
+    exclude = {t.strip() for t in a.exclude.split(",") if t.strip()}
+    if a.exclude_artifacts:
+        exclude |= set(ARTIFACT_TARGETS)
     rc = report(a.rows, out_json=(a.out_json or None), thresh=a.thresh,
                 n_perm=a.n_perm, max_evals=(a.max_evals or None),
-                arm=(a.arm or None))
+                arm=(a.arm or None), exclude=exclude)
     if a.compare:
         compare(a.rows, a.compare, label_a=a.label, label_b=a.compare_label,
-                arm=(a.arm or None))
+                arm=(a.arm or None), exclude=exclude)
     return rc
 
 
