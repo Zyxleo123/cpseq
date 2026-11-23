@@ -261,3 +261,52 @@ def test_compare_excludes_from_the_shared_set(tmp_path):
     ids = {t for t in (out.get("better") or [])} | {t for t in (out.get("worse") or [])}
     assert "5a29" not in ids
     assert out["n_shared"] == 1
+
+
+# --- paired ARM-vs-ARM comparison -------------------------------------------
+def test_compare_arms_pairs_two_arms_in_one_file(tmp_path):
+    """The LLM arm and its EA control live in the SAME rows file, so the
+    matched-budget question needs pairing within a file, not across files."""
+    rows = [_row("t1", 8, 0.20, arm="iter-ea"), _row("t1", 8, 0.10, arm="iter-llm"),
+            _row("t2", 9, 0.10, arm="iter-ea"), _row("t2", 9, 0.30, arm="iter-llm"),
+            _row("t3", 7, 0.05, arm="iter-ea"), _row("t3", 7, 0.05, arm="iter-llm")]
+    p = _write(tmp_path / "ca", rows)
+    out = PR.compare_arms(p, "iter-ea", "iter-llm")
+    assert out["n_shared"] == 3
+    assert out["better"] == ["t1"] and out["worse"] == ["t2"]
+    assert out["n_tied"] == 1
+    # Paired mean difference (llm - ea), per target: -0.10, +0.20, 0.00.
+    # abs= rather than the default relative tolerance: the function rounds to
+    # 6 dp so the JSON stays readable.
+    assert out["mean_regret_diff"] == pytest.approx((-0.10 + 0.20 + 0.00) / 3,
+                                                    abs=1e-6)
+
+
+def test_compare_arms_ties_are_excluded_from_the_sign_test(tmp_path):
+    """A tie on an additive objective means both operators found the same
+    optimum. Counting it as evidence of equality would confuse a saturated
+    target with a contested one."""
+    rows = []
+    for i in range(6):
+        rows += [_row(f"t{i}", 8, 0.1, arm="iter-ea"),
+                 _row(f"t{i}", 8, 0.1, arm="iter-llm")]
+    rows += [_row("tw", 8, 0.2, arm="iter-ea"), _row("tw", 8, 0.1, arm="iter-llm")]
+    p = _write(tmp_path / "cb", rows)
+    out = PR.compare_arms(p, "iter-ea", "iter-llm")
+    assert out["n_tied"] == 6 and out["n_better"] == 1 and out["n_worse"] == 0
+    # one target moved, in the stated direction: p = 1/2, NOT 1/2**7
+    assert out["sign_p"] == pytest.approx(0.5)
+
+
+def test_compare_arms_honours_exclusions(tmp_path):
+    """Contaminated targets (an unfunded LLM arm) must not reach the headline."""
+    rows = [_row("bad", 8, 0.00, arm="iter-ea"), _row("bad", 8, 0.00, arm="iter-llm"),
+            _row("t1", 8, 0.20, arm="iter-ea"), _row("t1", 8, 0.10, arm="iter-llm")]
+    p = _write(tmp_path / "cc", rows)
+    out = PR.compare_arms(p, "iter-ea", "iter-llm", exclude={"bad"})
+    assert out["n_shared"] == 1 and out["excluded"] == ["bad"]
+
+
+def test_compare_arms_gates_when_an_arm_is_absent(tmp_path):
+    p = _write(tmp_path / "cd", [_row("t1", 8, 0.1, arm="iter-ea")])
+    assert PR.compare_arms(p, "iter-ea", "iter-llm") is None

@@ -380,6 +380,94 @@ def compare(path_a, path_b, label_a="A", label_b="B", arm=None, exclude=None):
     return out
 
 
+def compare_arms(path, arm_a="iter-ea", arm_b="iter-llm", exclude=None,
+                 label_a=None, label_b=None):
+    """PAIRED comparison of two ARMS inside ONE rows file.
+
+    `compare()` pairs two FILES on the same arm, which answers "did more
+    generations help?". This answers the different question the LLM arm was run
+    for: at a matched budget and on the same targets, does the LLM operator
+    capture more of the reachable gain than the random EA?
+
+    Pairing is essential rather than cosmetic here. Between-target spread in
+    available gain is large (rho(length, gain) = -0.688), so an unpaired
+    difference of means at n~26 is swamped by which targets happen to be in the
+    set -- both arms see the SAME targets and the same seed pool, so the
+    per-target difference removes that variance entirely.
+
+    Ties are excluded from the sign test, not counted as agreement: on an
+    additive objective both arms frequently find the identical optimum, and
+    calling that "the operator made no difference" confuses a saturated target
+    with a contested one. The count of ties is reported separately because it is
+    the actual finding when it is large.
+    """
+    label_a = label_a or arm_a
+    label_b = label_b or arm_b
+    A = {r["target_id"]: r for r in load(path, arm=arm_a, exclude=exclude)}
+    B = {r["target_id"]: r for r in load(path, arm=arm_b, exclude=exclude)}
+    shared = sorted(set(A) & set(B))
+    if not shared:
+        print(f"GATE: no targets carry BOTH {arm_a} and {arm_b} in {path}")
+        return None
+    better = [k for k in shared if B[k]["regret"] < A[k]["regret"] - 1e-12]
+    worse = [k for k in shared if B[k]["regret"] > A[k]["regret"] + 1e-12]
+    moved = len(better) + len(worse)
+    p = float("nan")
+    if moved:
+        p = sum(math.comb(moved, k) for k in range(len(better), moved + 1)) \
+            / (2 ** moved)
+    diffs = [B[k]["regret"] - A[k]["regret"] for k in shared]
+    ndiffs = [B[k]["norm_regret"] - A[k]["norm_regret"] for k in shared]
+    out = {"source": str(path), "arm_a": arm_a, "arm_b": arm_b,
+           "n_shared": len(shared), "n_better": len(better),
+           "n_worse": len(worse), "n_tied": len(shared) - moved,
+           "sign_p": p, "better": better, "worse": worse,
+           "excluded": sorted(exclude or ()),
+           "mean_regret_diff": round(st.mean(diffs), 6),
+           "mean_norm_regret_diff": round(st.mean(ndiffs), 6)}
+    print(f"\nPAIRED ARMS: {label_b} vs {label_a} over {len(shared)} target(s) "
+          f"in one file")
+    for t in sorted(exclude or ()):
+        print(f"  EXCLUDED {t}: {ARTIFACT_TARGETS.get(t, 'excluded by request')}")
+    for lab, d in ((label_a, A), (label_b, B)):
+        g = [d[k] for k in shared]
+        ns = int(sum(r["solved"] for r in g))
+        ev = [r["n_evals"] for r in g if r["n_evals"] is not None]
+        out[lab] = {"solved": ns, "solved_frac": ns / len(g),
+                    "mean_regret": st.mean(r["regret"] for r in g),
+                    "mean_norm_regret": st.mean(r["norm_regret"] for r in g),
+                    "mean_evals": st.mean(ev) if ev else None}
+        print(f"  {lab:24s} solved {ns}/{len(g)} = {ns/len(g):4.0%}   "
+              f"mean regret {out[lab]['mean_regret']:.4f}   "
+              f"mean normalised {out[lab]['mean_norm_regret']:.3f}   "
+              f"mean evals {out[lab]['mean_evals'] or 0:.0f}")
+    print(f"  paired mean difference: {out['mean_regret_diff']:+.4f} raw, "
+          f"{out['mean_norm_regret_diff']:+.4f} normalised "
+          f"(negative = {label_b} captures more)")
+    print(f"  moved: {len(better)} better, {len(worse)} worse, "
+          f"{out['n_tied']} tied"
+          + (f"   sign test p({label_b} better) = {p:.4f}" if moved else ""))
+    if moved and len(worse) > len(better):
+        rev = sum(math.comb(moved, k) for k in range(len(worse), moved + 1)) \
+            / (2 ** moved)
+        print(f"  (one-sided in the stated direction, and {label_b} is the WORSE "
+              f"arm here; p({label_a} better) = {rev:.4f})")
+    if better:
+        print(f"  {label_b} better on: {', '.join(better)}")
+    if worse:
+        print(f"  {label_b} worse on : {', '.join(worse)}")
+    # The interpretation that is easiest to get wrong, stated explicitly.
+    if moved and 0.05 < p < 0.95:
+        print(f"  -> NOT separated at n={len(shared)}: the operators are within "
+              f"noise of each other on this set. That is a statement about "
+              f"POWER, not a demonstration that they are equivalent.")
+    elif not moved:
+        print("  -> every target is a tie: both operators found the identical "
+              "subs everywhere. On an additive objective this is the objective "
+              "being saturated, not the operators being equal in general.")
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--rows", required=True, help="seqmut_iter_pll_rows.jsonl")
@@ -404,6 +492,10 @@ def main() -> int:
                          f"({', '.join(sorted(ARTIFACT_TARGETS))}): peptides "
                          f"that are expression tags, where there is no binding "
                          f"signal to recover")
+    ap.add_argument("--compare-arms", default="",
+                    help="two arms in THIS file to pair, as 'armA:armB' (e.g. "
+                         "iter-ea:iter-llm). The matched-budget operator "
+                         "comparison the LLM arm is run for.")
     a = ap.parse_args()
     exclude = {t.strip() for t in a.exclude.split(",") if t.strip()}
     if a.exclude_artifacts:
@@ -414,6 +506,12 @@ def main() -> int:
     if a.compare:
         compare(a.rows, a.compare, label_a=a.label, label_b=a.compare_label,
                 arm=(a.arm or None), exclude=exclude)
+    if a.compare_arms:
+        if ":" not in a.compare_arms:
+            raise SystemExit("--compare-arms wants 'armA:armB'")
+        aa, bb = a.compare_arms.split(":", 1)
+        compare_arms(a.rows, arm_a=aa.strip(), arm_b=bb.strip(),
+                     exclude=exclude)
     return rc
 
 
