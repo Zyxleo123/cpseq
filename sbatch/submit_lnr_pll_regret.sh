@@ -22,6 +22,17 @@ export PLLREGRET_N_PERM="${PLLREGRET_N_PERM:-20000}"
 export PLLREGRET_THRESH="${PLLREGRET_THRESH:-0.05}"
 export PLLREGRET_MAX_EVALS="${PLLREGRET_MAX_EVALS:-0}"
 export PLLREGRET_ARM="${PLLREGRET_ARM:-}"
+# The iter-llm funding gate. CAP is the search's --max-spend-usd and N_EXPECTED
+# the number of targets it was meant to cover: together they let the job say
+# whether the budget was the binding constraint, and project the cap a valid
+# run would need. FORCE=1 grades a run the gate rejected (inspection only).
+export PLLREGRET_LLM_CAP="${PLLREGRET_LLM_CAP:-0}"
+export PLLREGRET_N_EXPECTED="${PLLREGRET_N_EXPECTED:-0}"
+export PLLREGRET_FORCE="${PLLREGRET_FORCE:-0}"
+# Target exclusions. ARTIFACTS drops the curated purification-tag set (5a29 is
+# a His7 tag + thrombin site, not a binder); EXCLUDE takes arbitrary ids.
+export PLLREGRET_EXCLUDE="${PLLREGRET_EXCLUDE:-}"
+export PLLREGRET_EXCLUDE_ARTIFACTS="${PLLREGRET_EXCLUDE_ARTIFACTS:-}"
 EOT
 echo "wrote $ENVF:"; sed 's/^/    /' "$ENVF"
 unset $(compgen -v | grep '^SLURM_' || true) 2>/dev/null || true

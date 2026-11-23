@@ -59,7 +59,16 @@ echo "wrote $ENVF:"; sed 's/^/    /' "$ENVF"
 # Scrubbed so a submission from inside an allocation does not inherit that job's
 # SLURM_* and confuse the new job's own resource view.
 unset $(compgen -v | grep '^SLURM_' || true) 2>/dev/null || true
-echo "+ sbatch ${SBATCH_DIR}/s4_lnr_seqmut_iter_pll.sbatch ${ENVF}"
-J=$(sbatch --parsable "${SBATCH_DIR}/s4_lnr_seqmut_iter_pll.sbatch" "${ENVF}")
+# The LLM arm's wall time is set by the API, not by the CPU: one call per
+# generation at n_gen=80 is ~5 min/target MEASURED (job 119761), so a 29-target
+# run does not fit the script's 4 h default. Overridden on the COMMAND LINE,
+# which a #SBATCH directive cannot read, and which is safe here -- the
+# `--export` hazard in this project is specific to export lists, not to
+# resource flags. The run is resumable either way, so a time limit costs a
+# resubmission rather than the run.
+TIME_ARG=()
+[ -n "${SEQITER_PLL_TIME:-}" ] && TIME_ARG=(--time "${SEQITER_PLL_TIME}")
+echo "+ sbatch ${TIME_ARG[*]} ${SBATCH_DIR}/s4_lnr_seqmut_iter_pll.sbatch ${ENVF}"
+J=$(sbatch --parsable "${TIME_ARG[@]}" "${SBATCH_DIR}/s4_lnr_seqmut_iter_pll.sbatch" "${ENVF}")
 echo "submitted: $J"
 echo "watch: tail -f ${RUN}/logs/s4_lnr_seqmut_iter_pll_${J}.out"
