@@ -1180,8 +1180,16 @@ jobs: 119392 (3-target validation, PASSED), 119413 (superseded, archived as
 
 ### HANDOFF — state at 2026-11-23, picking this up in a new session
 
-**Status: the `pll` evaluator is finished, verified and NOT COMMITTED. The LLM
-arm has NOT been run.** 221 tests pass (`python -m pytest agent/lnr/ -q`).
+**Status: the `pll` evaluator is finished and verified. Committed and pushed on
+branch `lnr/pll-inloop-evaluator`. The LLM arm is RUNNING as job 119773** (29
+targets, both arms, `n_gen=80`, $3.00 cap, 10 h, submitted 04:26).
+235 tests pass (`PYTHONPATH=agent:pilot/stage0 $PY -m pytest agent/lnr/ -q` —
+note `$PY` is `/zfsauton2/home/yixiz/Proteina-Complexa/.venv/bin/python`; the
+default `python` on `lov4` has no pytest).
+
+When 119773 lands, grade it with the command in "To run the LLM arm" below —
+the funding gate runs first and will refuse the comparison if the arm was not
+actually funded.
 
 #### What is done and believed
 
@@ -1195,13 +1203,17 @@ arm has NOT been run.** 221 tests pass (`python -m pytest agent/lnr/ -q`).
 
 #### What is NOT done
 
-1. **The LLM arm was never submitted.** Nothing is in the queue; the newest pll
-   job is 119665 (the regret analysis). It spends API budget, so it is a
-   deliberate decision, not an oversight.
-2. **Nothing is committed.** `git status` is the full change surface (below).
+1. ~~The LLM arm was never submitted.~~ **Submitted 2026-11-23 as job 119773**
+   (29-target subset, both arms, `n_gen=80`, cap **$3.00**, 10 h). See
+   "The $1.00 cap was structurally too small" below — the first attempt (119761)
+   was cancelled for that reason, not because it failed.
+2. ~~Nothing is committed.~~ **Committed on branch `lnr/pll-inloop-evaluator`**,
+   pushed to `origin`. Four commits: the binding-metric layer, the pll in-loop
+   layer, target exclusion, and the LLM funding gate.
 3. **The scope question is recorded but not decided** — `all` (graded) vs
    `window`/`iface` (more faithful to the LNR objective, ungraded). All three are
-   in every row, so deciding it needs no rerun.
+   in every row, so deciding it needs no rerun. **Still open, and it is a
+   judgement call about what the objective should be, not a computation.**
 4. **`k_mut` does not scale with length**, which the 1/L dilution says it should.
 
 #### To run the LLM arm (the obvious next step)
@@ -1219,9 +1231,37 @@ SEQITER_PLL_N_GEN=80 SEQITER_PLL_M_OFF=12 SEQITER_PLL_MAX_EVALS=900 \
 SEQITER_PLL_SEED_WINDOWS=$D/seqmut_iter_pll_rows.jsonl \
 SEQITER_PLL_ROWS_FILE=seqmut_iter_pll_rows.LLM.jsonl \
 SEQITER_PLL_TRAJ_FILE=seqmut_iter_pll_traj.LLM.jsonl \
-SEQITER_PLL_MAX_SPEND=1.0 \
+SEQITER_PLL_MAX_SPEND=3.0 \
+SEQITER_PLL_TIME=10:00:00 \
   sbatch/submit_lnr_seqmut_iter_pll.sh
 ```
+
+##### The $1.00 cap in the original version of this command was too small
+
+Not a judgement call — arithmetic. **The cap is per-RUN, not per-target:** the
+client, and therefore the `SpendLedger`, is built once in `seqmut_iter.main()`
+before the target loop and reused for every target. `llm_offspring` makes **one
+call per generation** (plus up to one retry when proposals repeat), so a
+29-target run at `n_gen=80` needs ~2,300–2,800 calls. At the client's own
+2600-in/700-out estimate, `gpt-6-luna` is **$0.00061/call**, so the run projects
+to **$1.42–$2.12** and $1.00 funds only **14–21 of the 29 targets**.
+
+Why that is worse than just stopping early: on `BUDGET_CAP`, `llm_offspring`
+**falls back to a random-EA child**. So the tail of the run is the EA arm
+wearing an LLM label — graded, averaged in, and *converging on the control*.
+The report would read "no difference", which is exactly the shape of the real
+conclusion ("separable, saturated, not won"). And because the cap is spent in
+target order, the contamination is the whole tail, not a random subset, so
+pairing cannot repair it.
+
+`SEQITER_PLL_TIME` exists because the LLM arm's wall clock is set by the API,
+not the CPU: **~5 min/target measured** (119761), which does not fit the
+script's 4 h `#SBATCH --time`. It is passed on the sbatch command line, which a
+`#SBATCH` directive cannot read. This is *not* the `--export` hazard — that one
+is specific to export lists, not resource flags.
+
+A cap is a **ceiling, not a spend**: raising $1 → $3 does not change the
+projected ~$1.70 actual cost, it only stops the run being truncated.
 
 Then grade it (CPU, rows only — the LLM-vs-EA control prints automatically):
 
@@ -1241,18 +1281,68 @@ PLLREGRET_OUT=$D/pll_regret_llm.json sbatch/submit_lnr_pll_regret.sh
 * **Both arms must be at `n_gen=80`** or the comparison is not matched — the EA
   baseline to compare against is `seqmut_iter_pll_rows.GEN80.jsonl`, not the
   25-generation file.
-* `--max-spend-usd` is enforced per arm by the ledger before each call.
+* `--max-spend-usd` is enforced by the ledger before each call, but it is a
+  budget for the **whole run**, not per target or per arm. See above.
 * If the LLM arm lands at regret 0 everywhere, the report says so itself
   ("separable … saturated, not won") — that is not a win, it is the objective
-  being additive.
+  being additive. **Check the funding verdict before accepting that reading**:
+  an unfunded arm produces the identical output.
 
-#### Files (all uncommitted)
+**The funding check is now automatic.** `s4_lnr_pll_regret.sbatch` runs
+`pll_llm_validity.py` first and refuses to print an LLM-vs-EA comparison from a
+run whose cap was reached or whose targets never called the model, exiting 0 so
+no dependent strands. Pass the cap so it can say whether the budget was the
+binding constraint:
+
+```bash
+PLLREGRET_ROWS=$D/seqmut_iter_pll_rows.LLM.jsonl PLLREGRET_MAX_EVALS=900 \
+PLLREGRET_LLM_CAP=3.0 PLLREGRET_N_EXPECTED=29 \
+PLLREGRET_OUT=$D/pll_regret_llm.json sbatch/submit_lnr_pll_regret.sh
+```
+
+Verdicts: `INVALID_TAIL` (budget cap or zero calls — absorbing and ordered,
+refuses to grade), `PARTIAL` (declines/malformed over half the generations —
+spread across targets, grade both with and without them), `VALID`. `ok_none` is
+**not** a fallback: "I choose not to mutate" is a real answer from the model.
+`PLLREGRET_FORCE=1` grades a rejected run for inspection only.
+
+**A free matched-arm check, worth running once.** This run re-runs `iter-ea` on
+the same 29 targets, and the EA arm is deterministic with the seed windows
+reused — so it must reproduce `GEN80` bit-identically. Verified on `1ee5`:
+regret 0.064, 282 evals, fitness −0.9521649118517178, subs `[[16,R],[18,H]]`,
+all identical. If this ever disagrees, the two arms did not see the same
+problem and the comparison is void:
+
+```bash
+$PY agent/lnr/pll_regret.py --rows $D/seqmut_iter_pll_rows.LLM.jsonl \
+    --compare $D/seqmut_iter_pll_rows.GEN80.jsonl --arm iter-ea \
+    --label LLMrun-EAarm --compare-label GEN80-EAarm
+```
+
+**`5a29` is not a binder.** Its peptide is `HHHHHHHSSGLVPRGSHA` — a His7 tag
+plus the thrombin cleavage site `LVPRGS`, i.e. a crystallisation construct.
+There is no binding signal for an operator to recover, so its regret is not
+evidence about the operator. It is 1 of the 29 graded targets (~3.4% of the
+weight) and sits at L=18, in the longest bin where the length effect is
+measured. Audited across all 85 selftest-indexable targets against
+His/thrombin/TEV/FLAG/myc/Strep/GS-linker patterns — it is the **only** one.
+Drop it with `PLLREGRET_EXCLUDE_ARTIFACTS=1` (the reason travels with the id, in
+`pll_regret.ARTIFACT_TARGETS`) and report headline numbers both ways.
+
+#### Files (committed on branch `lnr/pll-inloop-evaluator`, pushed)
+
+235 tests pass. Commits, oldest first: `acad786` binding-metric layer,
+`701e89b` pll in-loop layer, `4b2fc21` target exclusion + the 5a29 audit,
+`69b7080` the LLM funding gate.
 
 ```
 new   agent/lnr/pll_inloop.py        the PLLScorer + --selftest gate
-      agent/lnr/pll_regret.py        regret analysis + paired comparison
+      agent/lnr/pll_regret.py        regret analysis + paired comparison,
+                                     --exclude / --exclude-artifacts
+      agent/lnr/pll_llm_validity.py  the iter-llm funding gate (see above)
       agent/lnr/test_pll_inloop.py   27 tests
-      agent/lnr/test_pll_regret.py   18 tests
+      agent/lnr/test_pll_regret.py   22 tests
+      agent/lnr/test_pll_llm_validity.py  10 tests
       sbatch/s4_lnr_seqmut_iter_pll.sbatch  + submit_lnr_seqmut_iter_pll.sh
       sbatch/s4_lnr_pll_regret.sbatch       + submit_lnr_pll_regret.sh
 edit  agent/lnr/bindscore.py         TargetPSSM: metric-aware (DEFAULT pll_bg),
