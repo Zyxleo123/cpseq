@@ -25,6 +25,7 @@ report number are computed by identical code, differing only in the fold seed.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import sys
@@ -44,20 +45,30 @@ def variant_id(target_id, a, b, seq) -> str:
     return f"{target_id}_{a}_{b}_{key}"
 
 
-def fold_score_one(t, subs, window, cfg, work: Path, replicas: int = 4) -> dict:
+def fold_score_one(t, subs, window, cfg, work: Path, replicas: int = 4,
+                   draw: int = 0) -> dict:
     """Fold the MUTANT peptide held at `window` with Boltz (`replicas` samples from
     one trunk pass), score every replica's ring with Rosetta, return the denoised
     row (median dG_refined over sequence/ring-valid folds, + spread). Mirrors
-    boltz_validate.run_mut_held's per-variant block exactly."""
+    boltz_validate.run_mut_held's per-variant block exactly.
+
+    `draw` indexes an INDEPENDENT re-measurement of the same variant: it shifts the
+    Boltz seed and gives the prediction its own working directory, so draw 1 cannot
+    read back draw 0's structures. draw 0 keeps the original seed, stem and paths,
+    so every fold already in the cache stays valid and is never recomputed."""
     from proteinfoundation.cpseq.adapters.boltz2 import build_input_yaml, predict
     from proteinfoundation.cpseq.targets import write_target_template_cif
 
     a, b = window["a"], window["b"]
     seq = S.apply_subs(t.seq, subs)
-    stem = variant_id(t.target_id, a, b, seq)
+    vid = variant_id(t.target_id, a, b, seq)
+    stem = f"{vid}_d{int(draw)}" if draw else vid
     work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
-    rec = {"target_id": t.target_id, "variant_id": stem, "window": [a, b],
+    # variant_id stays CANONICAL (the identity boltz_validate/report rows use);
+    # cache_key carries the draw so repeats are stored side by side.
+    rec = {"target_id": t.target_id, "variant_id": vid, "cache_key": stem,
+           "draw": int(draw), "window": [a, b],
            "subs": [[int(i), aa.upper()] for i, aa in subs], "peptide_sequence": seq,
            "subs_key": S.subs_key(subs)}
     try:
@@ -97,6 +108,10 @@ def fold_score_one(t, subs, window, cfg, work: Path, replicas: int = 4) -> dict:
         rec["dG_refined_std"] = agg["dG_refined"]["std"]
         rec["dG_raw"] = agg["dG_raw"]["median"]
         rec["held_rmsd"] = agg["held_rmsd"]["median"]
+        # per-fold dG list (valid folds only): lets a consumer recompute the SEM
+        # at any n_folds and check whether the diffusion samples are independent
+        # draws. Cheap to carry; the in-loop search ignores it.
+        rec["per_fold_dG"] = [r.get("dG_refined") for r in reps if r.get("valid")]
         rec["valid"] = agg["n_valid"] > 0
         rec["score_status"] = "ok" if agg["n_valid"] > 0 else "no_valid_fold"
     except Exception as exc:  # noqa: BLE001
@@ -112,15 +127,17 @@ class BoltzScorer:
     fitness convention matches the proxy: dG_refined, MORE NEGATIVE = better; None
     when no replica produced a valid ring (the candidate is unscored, never 0)."""
 
-    is_gpu = True   # folds saturate the one GPU -> Population evaluates serially
-    folds = True    # re-folds the mutant -> LLM brief uses the folded objective
+    is_gpu = True       # folds saturate the one GPU -> Population evaluates serially
+    folds = True        # re-folds the mutant -> LLM brief uses the folded objective
+    stochastic = True   # a fitness is a DRAW: `draw=k` re-measures independently
 
     def __init__(self, cache_path, work, replicas: int = 4, seed: int = 1234,
                  use_potentials: bool = True):
         from proteinfoundation.cpseq.adapters.boltz2 import Boltz2Config
         self.cfg = Boltz2Config()
         self.cfg.use_potentials = use_potentials
-        self.cfg.seed = int(seed)                       # the loop's fold draw
+        self.base_seed = int(seed)
+        self.cfg.seed = self.base_seed                  # the loop's fold draw
         BV.configure_replicas(self.cfg, replicas)       # diffusion_samples=replicas
         self.replicas = replicas
         self.work = Path(work)
@@ -131,20 +148,40 @@ class BoltzScorer:
                 if line.strip():
                     try:
                         r = json.loads(line)
-                        self.mem[r["variant_id"]] = r
+                        # cache_key is draw-aware; pre-draw rows key on variant_id
+                        self.mem[r.get("cache_key") or r["variant_id"]] = r
                     except (json.JSONDecodeError, KeyError):
                         continue
         self._fh = None
 
-    def score(self, t, subs, window):
-        """Returns (fitness_or_None, row). Cached by variant_id."""
+    def sem(self, row) -> float:
+        """Standard error of this row's median dG over its own folds -- the noise
+        estimate available before a genome has been measured twice."""
+        if not row:
+            return 0.0
+        sd, n = row.get("dG_refined_std"), row.get("n_valid_folds")
+        if not isinstance(sd, (int, float)) or not isinstance(n, int) or n < 1:
+            return 0.0
+        return float(sd) / (float(n) ** 0.5)
+
+    def score(self, t, subs, window, draw: int = 0):
+        """Returns (fitness_or_None, row). Cached by (variant, draw). `draw > 0`
+        is an INDEPENDENT re-measurement: a different Boltz seed and its own output
+        directory, so it is a genuine second sample of the same genome's fitness
+        rather than a cache hit."""
         a, b = window["a"], window["b"]
         seq = S.apply_subs(t.seq, subs)
         vid = variant_id(t.target_id, a, b, seq)
-        row = self.mem.get(vid)
+        key = f"{vid}_d{int(draw)}" if draw else vid
+        row = self.mem.get(key)
         if row is None:
-            row = fold_score_one(t, subs, window, self.cfg, self.work, self.replicas)
-            self.mem[vid] = row
+            cfg = self.cfg
+            if draw:
+                cfg = copy.copy(self.cfg)
+                cfg.seed = self.base_seed + 7919 * int(draw)   # a distinct draw
+            row = fold_score_one(t, subs, window, cfg, self.work, self.replicas,
+                                 draw=int(draw))
+            self.mem[key] = row
             self._append(row)
         return row.get("dG_refined"), row
 
@@ -168,14 +205,18 @@ class ProxyScorer:
     GPU)."""
 
     is_gpu = False
-    folds = False   # fixed-pose retention proxy -> LLM brief uses the proxy framing
+    folds = False       # fixed-pose retention proxy -> brief uses the proxy framing
+    stochastic = False  # deterministic: a redraw is the same number, so no repeats
 
     def __init__(self, cache, relax_repeats: int = 1, timeout: float = 900.0):
         self.cache = cache
         self.relax_repeats = relax_repeats
         self.timeout = timeout
 
-    def score(self, t, subs, window):
+    def sem(self, row) -> float:
+        return 0.0
+
+    def score(self, t, subs, window, draw: int = 0):
         scan = S.mutant_scan(t, list(subs), self.cache,
                              relax_repeats=self.relax_repeats, timeout=self.timeout)
         rec = None

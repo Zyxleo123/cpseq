@@ -361,3 +361,264 @@ def test_single_shot_seqmut_rejects_iter_arms(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as e:
         S.main()
     assert "seqmut_iter.py" in str(e.value)
+
+
+# --- noisy-fitness defences (each test pins one MEASURED failure mode) --------
+
+class _NoisyBoltz:
+    """Stochastic evaluator stand-in. Every genome's TRUE fitness is -20 - 5*n_W,
+    but a measurement adds a per-draw offset, so draw 0 of the WT is a lucky -30
+    while its truth is -20 -- exactly the optimizer's curse seen on 1bjr, where a
+    lucky in-loop draw of -8.01 REU vs wild-type realised -0.57 on a redraw."""
+
+    is_gpu = True
+    folds = True
+    stochastic = True
+
+    def __init__(self, lucky_key="", lucky_offset=-10.0):
+        self.calls = 0
+        self.draws = []
+        self.lucky_key = lucky_key
+        self.lucky_offset = lucky_offset
+
+    def truth(self, subs):
+        n_w = sum(1 for _, a in subs if str(a).upper() == "W")
+        return -20.0 - 5.0 * n_w + 1.0 * (len(subs) - n_w)
+
+    def sem(self, row):
+        return row.get("dG_refined_std", 0.0) / 2.0
+
+    def score(self, t, subs, window, draw=0):
+        self.calls += 1
+        self.draws.append((S.subs_key(subs), draw))
+        dG = self.truth(subs)
+        if draw == 0 and S.subs_key(subs) == self.lucky_key:
+            dG += self.lucky_offset              # the lucky first draw
+        return dG, {"dG_refined": dG, "dG_refined_std": 4.0, "n_valid_folds": 4,
+                    "variant_id": "x", "draw": draw}
+
+    def close(self):
+        pass
+
+
+def test_arms_share_an_identical_seed_population(patched):
+    """The matched-budget control was confounded at the seed: evolve() keyed the
+    RNG on the arm, so each arm drew a DIFFERENT starting pool (measured mean gap
+    7.66 REU between arms, 19.7 on 1jrr -- larger than the effect being read)."""
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    win = {"a": 0, "b": 9, "retention": 1.0, "clean": True}
+    seeds = {}
+    for arm, llm in (("iter-ea", None),
+                     ("iter-llm", _scripted(["<mut>0:W</mut>"])),
+                     ("iter-llm-ala", _scripted(["<mut>0:W</mut>"]))):
+        pop, traj, _ = I.evolve(arm, t, win, S.ScanCache(Path("/dev/null")),
+                                k_mut=2, n_seed=6, n_gen=1, m_off=2, max_evals=10,
+                                elite_frac=0.4, relax_repeats=1, timeout=1.0,
+                                llm=llm, n_workers=1)
+        gen0 = {S.subs_key(m["subs"]) for m in pop.members.values() if m["gen"] == 0}
+        seeds[arm] = (gen0, traj[0]["best_recovered"])
+    pools = [v[0] for v in seeds.values()]
+    assert pools[0] == pools[1] == pools[2], "arms must start from the same pool"
+    assert len({v[1] for v in seeds.values()}) == 1, "and so from the same frontier"
+
+
+def test_seed_pool_is_stable_across_arms_but_operator_draws_are_not(patched):
+    """The seed RNG is arm-independent; the OPERATOR rng must still be per-arm so
+    the EA's draws are not coupled to the LLM arm's fallbacks."""
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    win = {"a": 0, "b": 9, "retention": 1.0, "clean": True}
+    out = {}
+    for arm in ("iter-ea", "iter-llm"):
+        pop, _, _ = I.evolve(arm, t, win, S.ScanCache(Path("/dev/null")),
+                             k_mut=2, n_seed=4, n_gen=3, m_off=3, max_evals=20,
+                             elite_frac=0.4, relax_repeats=1, timeout=1.0,
+                             llm=(None if arm == "iter-ea" else
+                                  _scripted(["<mut>7:W</mut>"])), n_workers=1)
+        out[arm] = {S.subs_key(m["subs"]) for m in pop.members.values() if m["gen"] > 0}
+    assert out["iter-ea"] != out["iter-llm"]      # operators diverge after seeding
+
+
+def test_reassess_corrects_a_lucky_incumbent_and_costs_budget():
+    """Without re-measurement one lucky draw owns the frontier for the whole run."""
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    win = {"a": 0, "b": 9, "retention": 1.0, "clean": True}
+    sc = _NoisyBoltz(lucky_key="", lucky_offset=-10.0)   # WT measured lucky at -30
+    pop = I.Population(t, win, S.ScanCache(Path("/dev/null")), 2, 1, 1.0, 20,
+                       scorer=sc)
+    pop.evaluate([], gen=0)
+    assert pop.members[""]["recovered"] == -30.0        # the lucky draw
+    before_evals = pop.evals
+    shift = pop.reassess(pop.members[""], gen=1)
+    assert pop.evals == before_evals + 1                # honestly charged
+    assert pop.reassessments == 1
+    assert sc.draws[-1] == ("", 1)                      # an INDEPENDENT draw
+    assert pop.members[""]["recovered"] == -25.0        # mean of -30 and -20
+    assert shift == 5.0                                 # the curse, measured live
+    assert len(pop.members[""]["obs"]) == 2 and pop.members[""]["sem"] > 0
+
+
+def test_reassess_is_a_noop_and_free_on_a_deterministic_evaluator(patched):
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    win = {"a": 0, "b": 9, "retention": 1.0, "clean": True}
+    pop = I.Population(t, win, S.ScanCache(Path("/dev/null")), 2, 1, 1.0, 20)
+    pop.evaluate([], gen=0)
+    n = pop.evals
+    assert pop.reassess(pop.best(), gen=1) is None
+    assert pop.evals == n and pop.reassessments == 0
+
+
+def test_commit_is_pessimistic_and_exploration_optimistic():
+    """A noisy -31 must not outrank a well-measured -30 when we COMMIT, but it
+    must still be explored."""
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    win = {"a": 0, "b": 9, "retention": 1.0, "clean": True}
+    pop = I.Population(t, win, S.ScanCache(Path("/dev/null")), 2, 1, 1.0, 20,
+                       z_explore=1.0, z_commit=1.0)
+    pop.members["noisy"] = {"subs": ((0, "W"),), "obs": [-36.0, -26.0],
+                            "recovered": -31.0, "sem": 5.0, "gen": 1}
+    pop.members["solid"] = {"subs": ((1, "W"),), "obs": [-30.0, -30.0],
+                            "recovered": -30.0, "sem": 0.1, "gen": 1}
+    assert S.subs_key(pop.best()["subs"]) == "1:W"      # commit to the solid one
+    assert S.subs_key(pop.leader()["subs"]) == "0:W"    # explore the noisy one
+    assert S.subs_key(pop.elite(1.0)[0]["subs"]) == "0:W"
+
+
+def test_brief_shows_noise_tried_set_and_an_exploration_floor():
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    win = {"a": 0, "b": 9, "retention": 1.0, "clean": True}
+    elite = [{"subs": ((2, "W"),), "obs": [-30.0], "recovered": -30.0, "sem": 2.0,
+              "gen": 1}]
+    tried = [{"subs": ((5, "D"),), "obs": [-10.0], "recovered": -10.0, "sem": 1.0,
+              "gen": 0}]
+    b = I.iter_brief(t, win, 2, elite, 4, 2, folded=True, tried=tried, noise_sd=2.0)
+    assert "+/-SE" in b and "NOISY MEASUREMENTS" in b
+    assert "5:D" in b and "do not propose these" in b   # the failure memory
+    assert "NOT on the frontier" in b                   # the exploration floor
+    assert "Positions already on the frontier: 2" in b
+    # the deterministic-proxy brief keeps its old shape (no noise language)
+    plain = I.iter_brief(t, win, 2, elite, 4, 2, folded=False)
+    assert "NOISY MEASUREMENTS" not in plain and "score(REU)" in plain
+
+
+def test_llm_offspring_drops_repeats_and_reasks_once(patched):
+    """34-45% of LLM proposals re-proposed a genome already in the pool. A repeat
+    now costs a re-ask, not a proposal slot."""
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    win = {"a": 0, "b": 9, "retention": 1.0, "clean": True}
+    elite = [{"subs": ((2, "W"),), "obs": [-30.0], "recovered": -30.0, "sem": 0.0,
+              "gen": 1}]
+    meta = {"llm_calls": 0, "llm_cost_usd": 0.0, "status_counts": {}}
+    llm = _scripted(["<mut>2:W</mut>\n<mut>3:D</mut>",     # 2:W and 3:D both known
+                     "<mut>7:W</mut>\n<mut>8:Y</mut>"])    # the re-ask delivers
+    kids = I.llm_offspring(llm, t, win, 2, elite, 2, 1, None, meta,
+                           __import__("random").Random(0), list(range(10)),
+                           known={"2:W", "3:D"}, tried=())
+    keys = {S.subs_key(g) for g, _ in kids}
+    assert keys == {"7:W", "8:Y"}            # nothing already measured is returned
+    assert meta["n_dup_proposed"] == 2
+    assert meta["llm_calls"] == 2            # one re-ask, then done
+    assert meta.get("fallback_gens") is None  # the EA fallback was NOT needed
+
+
+def test_llm_offspring_falls_back_only_when_the_reask_also_fails(patched):
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    win = {"a": 0, "b": 9, "retention": 1.0, "clean": True}
+    elite = [{"subs": ((2, "W"),), "obs": [-30.0], "recovered": -30.0, "sem": 0.0,
+              "gen": 1}]
+    meta = {"llm_calls": 0, "llm_cost_usd": 0.0, "status_counts": {}}
+    llm = _scripted(["<mut>2:W</mut>", "<mut>2:W</mut>"])   # only ever a repeat
+    kids = I.llm_offspring(llm, t, win, 2, elite, 2, 1, None, meta,
+                           __import__("random").Random(0), list(range(10)),
+                           known={"2:W"}, tried=())
+    assert kids and meta["fallback_gens"] == 1
+    assert meta["status_counts"].get("all_duplicates") == 1
+
+
+def test_evolve_logs_the_noise_accounting_in_traj_and_finalist(patched):
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    win = {"a": 0, "b": 9, "retention": 1.0, "clean": True}
+    sc = _NoisyBoltz(lucky_key="", lucky_offset=-10.0)
+    pop, traj, meta = I.evolve("iter-ea", t, win, S.ScanCache(Path("/dev/null")),
+                               k_mut=2, n_seed=4, n_gen=3, m_off=2, max_evals=20,
+                               elite_frac=0.5, relax_repeats=1, timeout=1.0,
+                               n_workers=1, scorer=sc)
+    gens = [d for d in traj if d.get("phase") != "seed"]
+    assert gens and all("incumbent_shift" in d for d in gens)
+    assert pop.reassessments >= 1
+    row = I._finalist_row(t, "iter-ea", win, S.ScanCache(Path("/dev/null")), pop,
+                          traj, meta, 2, 1, 1.0, "placement_search")
+    it = row["iter"]
+    assert it["n_reassess"] >= 1 and it["best_n_obs"] >= 1
+    assert "mean_incumbent_shift" in it and "best_sem" in it
+
+
+def test_no_reassess_restores_the_single_draw_frontier(patched):
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    win = {"a": 0, "b": 9, "retention": 1.0, "clean": True}
+    sc = _NoisyBoltz()
+    pop, _, _ = I.evolve("iter-ea", t, win, S.ScanCache(Path("/dev/null")),
+                         k_mut=2, n_seed=4, n_gen=3, m_off=2, max_evals=20,
+                         elite_frac=0.5, relax_repeats=1, timeout=1.0,
+                         n_workers=1, scorer=sc, reassess=False)
+    assert pop.reassessments == 0
+    assert all(len(m["obs"]) <= 1 for m in pop.scored())
+
+
+def test_ea_offspring_resamples_known_genomes_so_both_arms_spend_the_budget():
+    """The LLM arm re-asks on a repeat; the EA must resample on one, or it quietly
+    makes fewer DISTINCT evaluations than its own control (measured 18 vs 24 of a
+    24-eval budget) and the matched-budget comparison is void."""
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    elite = [{"subs": ((0, "W"),), "obs": [-30.0], "recovered": -30.0, "sem": 0.0,
+              "gen": 0},
+             {"subs": ((0, "W"), (1, "Y")), "obs": [-28.0], "recovered": -28.0,
+              "sem": 0.0, "gen": 0}]
+    rng = __import__("random").Random(5)
+    # every genome the two elites can produce by plain crossover is "known"
+    known = {"0:W", "1:Y", "0:W,1:Y", ""}
+    kids = I.ea_offspring(elite, t, 2, list(range(10)), rng, 6, known=known)
+    assert len(kids) == 6
+    keys = [S.subs_key(g) for g, _ in kids]
+    assert not (set(keys) & known), f"EA returned already-known genomes: {keys}"
+    assert len(set(keys)) == 6, f"EA returned duplicates within the batch: {keys}"
+
+
+def test_ea_offspring_without_known_is_unchanged():
+    """Default call site behaviour (no `known`) must be the old one."""
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    elite = [{"subs": ((0, "W"),), "obs": [-30.0], "recovered": -30.0, "sem": 0.0,
+              "gen": 0}]
+    kids = I.ea_offspring(elite, t, 2, list(range(10)),
+                          __import__("random").Random(5), 3)
+    assert len(kids) == 3
+    assert all(len(g) <= 2 for g, _ in kids)
+    assert all(pr == -30.0 for _, pr in kids)
+
+
+def test_brief_states_the_wild_type_bar_even_when_wt_is_not_elite():
+    """Every headline number is paired against nomut, so the WT score is THE bar.
+    It is usually not in the elite, and the old text pointed at a '(none)' row
+    that was not on screen."""
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    win = {"a": 0, "b": 9, "retention": 1.0, "clean": True}
+    elite = [{"subs": ((2, "W"),), "obs": [-30.0], "recovered": -30.0, "sem": 1.0,
+              "gen": 1}]
+    b = I.iter_brief(t, win, 2, elite, 4, 2, folded=True, wt_score=-20.85)
+    assert "wild-type peptide, unmodified, scores -20.85 REU" in b
+    # with no WT score known, fall back to naming the (none) row
+    b2 = I.iter_brief(t, win, 2, elite, 4, 2, folded=True)
+    assert "'(none)' below is the wild-type sequence" in b2
+
+
+def test_finalist_row_persists_llm_raw_when_save_raw_is_set(patched):
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    win = {"a": 0, "b": 9, "retention": 1.0, "clean": True}
+    pop, traj, meta = I.evolve("iter-llm", t, win, S.ScanCache(Path("/dev/null")),
+                               k_mut=2, n_seed=3, n_gen=2, m_off=2, max_evals=10,
+                               elite_frac=0.5, relax_repeats=1, timeout=1.0,
+                               llm=_scripted(["<mut>0:W</mut>\n<mut>1:W</mut>"]),
+                               save_raw=True, n_workers=1)
+    row = I._finalist_row(t, "iter-llm", win, S.ScanCache(Path("/dev/null")), pop,
+                          traj, meta, 2, 1, 1.0, "placement_search")
+    assert row.get("llm_raw"), "--save-raw collected replies but dropped them"
+    assert any("<mut>" in r for r in row["llm_raw"])

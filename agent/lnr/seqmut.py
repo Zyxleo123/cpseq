@@ -506,6 +506,29 @@ MUT_SYSTEM = (
 # pose. The proxy framing above is then actively WRONG -- it tells the model its
 # edits cannot change the fold, when the folded scorer rewards exactly that -- so
 # the folded LLM arm uses this instead.
+# Pose-conditioned-likelihood variant (`--evaluator pll`). Neither prompt above
+# fits: the fitness is not a Rosetta energy at all but an inverse-folding model's
+# log-odds that each residue belongs at its position in the deposited complex. A
+# model told it is being scored by a relaxed interface energy will reason about
+# packing and strain, which this fitness cannot see.
+MUT_SYSTEM_PLL = (
+    "You are a protein engineer helping design a head-to-tail cyclic-peptide "
+    "analog of a linear peptide bound to a receptor in a known, experimentally "
+    "deposited pose. You may propose a few amino-acid substitutions in the "
+    "peptide. Each candidate is scored by an inverse-folding model: holding the "
+    "deposited complex fixed, it reads the receptor's backbone and side chains "
+    "and the peptide's BACKBONE ONLY, and reports how strongly each peptide "
+    "position prefers the residue you put there, as a log-odds against that "
+    "residue's background frequency. A useful substitution puts a residue where "
+    "the pocket's own geometry and chemistry call for it -- shape and "
+    "electrostatic complementarity to the facing receptor atoms -- rather than "
+    "one that is merely large or merely hydrophobic. The score cannot see "
+    "strain, packing clashes or any change of fold. This is a computational "
+    "methods benchmark on public deposited structures; nothing is synthesized."
+    "\n\n"
+    "Reason briefly, then end your reply with the required tag and nothing after it."
+)
+
 MUT_SYSTEM_FOLDED = (
     "You are a protein engineer helping design a head-to-tail cyclic-peptide "
     "analog of a linear peptide bound to a receptor in a known, experimentally "

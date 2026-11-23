@@ -37,9 +37,17 @@ TARGETS="${SEQITER_TARGETS:-1bjr,1elr}"   # the campaign's targets (NOT s4_lnr_b
 # seqmut*_rows.jsonl and lets later-sorting files overwrite by (target,arm_label),
 # so a stale proxy-loop seqmut_iter_ea/llm_rows.jsonl would clobber the real
 # finalist. Stage a dir holding only the intended rows file and point at it.
-SEQMUT_SRC="${RUN}/lnr/seqmut_iter_boltz_rows.jsonl"
+# Overridable so a v2 (noise-defended) loop can be reported without touching v1.
+SEQMUT_SRC="${SEQITER_SEQMUT_SRC:-${RUN}/lnr/seqmut_iter_boltz_rows.jsonl}"
 STAGE="${RUN}/lnr/iter_boltz_finalists"
-mkdir -p "$STAGE"; ln -sf "$SEQMUT_SRC" "$STAGE/seqmut_iter_boltz_rows.jsonl"
+mkdir -p "$STAGE"
+# Exactly ONE rows file may be staged: run_mut_held globs seqmut*_rows.jsonl
+# and lets a later-sorting file overwrite by (target,arm_label), so a stale
+# sibling here silently clobbers the intended finalist. Clear only the links
+# this script itself plants -- never recurse, never touch a real file.
+find "$STAGE" -maxdepth 1 -type l -name "seqmut*_rows.jsonl" -delete
+ln -sf "$SEQMUT_SRC" "$STAGE/$(basename "$SEQMUT_SRC")"
+echo "staged finalists: $SEQMUT_SRC"
 cat > "$FOLD_ENV" <<EOF
 export LNR_BOLTZ_MODE="mut-held"
 export LNR_BOLTZ_TARGETS="${TARGETS}"

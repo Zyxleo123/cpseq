@@ -119,6 +119,59 @@ export ROSVAL_CANDIDATES="${ROSVAL_CANDIDATES:-W,F,L,R}"
 export ROSVAL_NPROBE="${ROSVAL_NPROBE:-2}"
 export ROSVAL_LIMIT="${ROSVAL_LIMIT:-0}"
 
+# ---------------------------------------------------------------------------
+# CPSet cyclic-peptide accuracy gate (s4_lnr_cpset_accuracy.sbatch)
+# ---------------------------------------------------------------------------
+# Ground truth: CPSet Dataset I (Zhao et al. Brief Bioinform 2025,
+# doi 10.1093/bib/bbaf632; data github.com/huifengzhao/MM_PBGBSA-CP) -- 50
+# protein-cyclic-peptide crystal complexes with experimental Kd. 38 of them form
+# 10 congeneric series (same receptor, peptide variants), which is the
+# WITHIN-TARGET instrument the project has lacked; the paper's own validation is
+# cross-complex only, so its Rp numbers calibrate nothing here but the
+# cross-complex row.
+export CPSET_DATA_DIR="${CPSET_DATA_DIR:-${RUN}/cpset_raw}"
+export CPSET_OUT="${CPSET_OUT:-${RUN}/lnr/cpset_dg.jsonl}"
+export CPSET_WORK_DIR="${CPSET_WORK_DIR:-${RUN}/cpset_prepared}"
+export CPSET_REPLICAS="${CPSET_REPLICAS:-3}"
+export CPSET_TIMEOUT="${CPSET_TIMEOUT:-1800}"
+# Only `rosetta` exists today; MM/PBSA per the paper's tuned protocol
+# (ff03 / implicit / eps_in=2 / no entropy / minimization-only) lands here if
+# and only if the Rosetta baseline loses on this instrument.
+export CPSET_SCORER="${CPSET_SCORER:-rosetta}"
+
+# ---------------------------------------------------------------------------
+# Candidate binding metric gate (s4_lnr_bindscore.sbatch)
+# ---------------------------------------------------------------------------
+# Pose-conditioned interface likelihood (ICG) -- the metric that answers "does
+# THIS residue at THIS position suit THIS pocket", which is what the measured
+# SAR is made of and what every prior metric (dG = buried area, ipTM = structure
+# confidence, ESM-2/PepMLM = peptide plausibility) failed to ask. CPU only; the
+# structure encoder never reads the sequence, so templates are encoded once and
+# variants are nearly free. Pre-registration: docs/binding_metric_design.md.
+export BINDSCORE_OUT="${BINDSCORE_OUT:-${RUN}/lnr/bindscore.jsonl}"
+export BINDSCORE_MODELS="${BINDSCORE_MODELS:-ligandmpnn_v_32_020_25}"
+export BINDSCORE_SERIES="${BINDSCORE_SERIES:-}"
+export BINDSCORE_ORDER_SEED="${BINDSCORE_ORDER_SEED:-0}"
+export LIGANDMPNN_HOME="${LIGANDMPNN_HOME:-/zfsauton2/home/yixiz/Proteina-Complexa/community_models/LigandMPNN}"
+
+# ---------------------------------------------------------------------------
+# Pose-conditioned-likelihood IN-LOOP fitness (s4_lnr_seqmut_iter_pll.sbatch)
+# ---------------------------------------------------------------------------
+# The same metric as BINDSCORE_* above, deployed as the search's fitness instead
+# of being graded against measured Kd. CPU only and bitwise deterministic, so
+# the loop's noise defences switch themselves off; and exactly solvable, so each
+# arm is graded by REGRET against the known optimum rather than by its score.
+# `all` is the scope that was graded -- `window`/`iface` are recorded in every
+# row regardless, so changing the choice never needs a rerun.
+export SEQITER_PLL_METRIC="${SEQITER_PLL_METRIC:-pll_bg}"
+export SEQITER_PLL_SCOPE="${SEQITER_PLL_SCOPE:-all}"
+export SEQITER_PLL_MODEL="${SEQITER_PLL_MODEL:-ligandmpnn_v_32_020_25}"
+export SEQITER_PLL_DEVICE="${SEQITER_PLL_DEVICE:-cpu}"
+# iter-ea alone by default: free, deterministic, and the baseline the LLM arm is
+# measured against. Adding iter-llm spends API budget.
+export SEQITER_PLL_ARMS="${SEQITER_PLL_ARMS:-iter-ea}"
+export SEQITER_PLL_MAX_EVALS="${SEQITER_PLL_MAX_EVALS:-400}"
+
 banner() {
   # Printed FIRST, before any pipeline that could take SIGPIPE: a job whose
   # first command is `find | sort | head` dies with exit 141 and a zero-byte

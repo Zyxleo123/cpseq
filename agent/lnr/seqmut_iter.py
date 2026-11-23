@@ -106,15 +106,40 @@ def _iface_positions(t) -> list:
 # ---------------------------------------------------------------------------
 
 class Population:
-    """Genome -> cached proxy fitness, with a hard distinct-evaluation budget.
+    """Genome -> cached fitness, with a hard distinct-evaluation budget.
 
     fitness = recovered_binding_energy (REU); MORE NEGATIVE IS BETTER, so the
     frontier is the minimum. A genome that fails to score (scan error/timeout) is
     remembered with recovered=None so it is neither re-scored nor ever elite.
+
+    NOISY FITNESS (the measured failure this class now defends against)
+    ------------------------------------------------------------------
+    Under `--evaluator boltz` a fitness is a MEASUREMENT, not a value: the median
+    of 4 stochastic folds, whose own spread is sd ~3.7 REU (SEM ~1.9), and whose
+    run-to-run reproducibility on the SAME variant was measured at ~4 REU
+    (1bjr wild-type across independent draws: -20.9 / -24.3 / -26.8 / -26.9).
+    Taking the argmin of N such draws is the optimizer's curse: the winner is
+    optimistic by ~1-2 SEM purely by selection. Measured on the first real-score
+    loop, 61% of the apparent gain vs wild-type evaporated when the finalist was
+    re-folded with an independent seed (1bjr iter-llm: -8.01 -> -0.57 REU).
+
+    So a member keeps ALL its observations, not one:
+      obs       every independent draw of this genome's fitness
+      recovered the running MEAN (the unbiased point estimate; what gets reported)
+      sem       standard error of that mean (from repeats when n>=2, else the
+                evaluator's own within-draw SEM via `scorer.sem(row)`)
+    and selection uses an interval, not the point:
+      elite()  ranks OPTIMISTICALLY (mean - z_explore*sem) -- a noisy candidate
+               stays in contention long enough to be re-measured (UCB-style).
+      best()   commits PESSIMISTICALLY (mean + z_commit*sem) -- the finalist we
+               spend the real oracle on must be good because it IS good, not
+               because it was measured luckily (LCB-style).
+    With a deterministic evaluator (the proxy) sem == 0 and both rules collapse to
+    the old argmin, so the proxy path is behaviourally unchanged.
     """
 
     def __init__(self, t, window, cache, k_mut, relax_repeats, timeout, max_evals,
-                 scorer=None):
+                 scorer=None, z_explore: float = 1.0, z_commit: float = 1.0):
         self.t = t
         self.window = window
         self.cache = cache
@@ -131,11 +156,46 @@ class Population:
             from lnr.boltz_inloop import ProxyScorer
             scorer = ProxyScorer(cache, relax_repeats, timeout)
         self.scorer = scorer
-        self.members: dict = {}   # subs_key -> {"subs": tuple, "recovered": float|None, "gen": int}
-        self.evals = 0            # distinct genomes THIS arm has scored (budget)
+        self.z_explore = float(z_explore)
+        self.z_commit = float(z_commit)
+        # subs_key -> {"subs", "obs": [float], "recovered": mean|None, "sem", "gen"}
+        self.members: dict = {}
+        self.evals = 0            # evaluations THIS arm has spent (budget)
+        self.reassessments = 0    # of those, re-measurements of a known genome
 
     def budget_left(self) -> bool:
         return self.evals < self.max_evals
+
+    def _scorer_sem(self, row) -> float:
+        """The evaluator's own within-draw SEM, used while a genome has a single
+        observation. Deterministic evaluators report 0."""
+        fn = getattr(self.scorer, "sem", None)
+        if fn is None:
+            return 0.0
+        try:
+            v = fn(row)
+        except Exception:  # noqa: BLE001  a sem estimate must never fail a run
+            return 0.0
+        return float(v) if isinstance(v, (int, float)) and v == v else 0.0
+
+    def _record(self, key, g, rec, row, gen: int):
+        """Fold one observation into a member (creating it on first sight)."""
+        m = self.members.get(key)
+        if m is None:
+            m = self.members[key] = {"subs": g, "obs": [], "recovered": None,
+                                     "sem": 0.0, "gen": gen}
+        if rec is None:
+            return m
+        m["obs"].append(float(rec))
+        n = len(m["obs"])
+        m["recovered"] = sum(m["obs"]) / n
+        if n >= 2:
+            mean = m["recovered"]
+            var = sum((x - mean) ** 2 for x in m["obs"]) / (n - 1)
+            m["sem"] = (var ** 0.5) / (n ** 0.5)
+        else:
+            m["sem"] = self._scorer_sem(row)
+        return m
 
     def evaluate(self, subs, gen: int):
         """Score `subs` with the evaluator (cached). Returns fitness (or None).
@@ -147,10 +207,36 @@ class Population:
             return self.members[key]["recovered"]
         if not self.budget_left():
             return None
-        rec, _row = self.scorer.score(self.t, list(g), self.window)
+        rec, row = self.scorer.score(self.t, list(g), self.window)
         self.evals += 1
-        self.members[key] = {"subs": g, "recovered": rec, "gen": gen}
-        return rec
+        self._record(key, g, rec, row, gen)
+        return self.members[key]["recovered"]
+
+    def reassess(self, member, gen: int):
+        """Re-measure an ALREADY-scored genome with a fresh independent draw and
+        fold it into that member's running mean. This is the direct fix for the
+        optimizer's curse: without it the incumbent frontier is whatever single
+        draw happened to come out lowest, it is never corrected, and every later
+        generation is conditioned on it.
+
+        Costs one unit of the SAME budget an offspring would cost, so the arms
+        stay fitness-evaluation matched. A no-op (returns None, charges nothing)
+        on a deterministic evaluator, where a redraw cannot differ."""
+        if not getattr(self.scorer, "stochastic", False):
+            return None
+        if member is None or not self.budget_left():
+            return None
+        g = member["subs"]
+        key = S.subs_key(g)
+        before = member["recovered"]
+        rec, row = self.scorer.score(self.t, list(g), self.window,
+                                     draw=len(member["obs"]))
+        self.evals += 1
+        self.reassessments += 1
+        if rec is None:
+            return None
+        self._record(key, g, rec, row, gen)
+        return round(self.members[key]["recovered"] - before, 3)
 
     def evaluate_many(self, subs_list, gen: int, n_workers: int = 1) -> dict:
         """Score a batch of genomes, evaluating the NEW ones concurrently when the
@@ -177,43 +263,84 @@ class Population:
             return results
 
         def _run(g):
-            rec, _row = self.scorer.score(self.t, list(g), self.window)
-            return rec
+            return self.scorer.score(self.t, list(g), self.window)
 
         if n_workers and n_workers > 1 and len(to_score) > 1:
             with ThreadPoolExecutor(max_workers=min(n_workers, len(to_score))) as ex:
-                recs = list(ex.map(lambda kg: _run(kg[1]), to_score))
+                out = list(ex.map(lambda kg: _run(kg[1]), to_score))
         else:
-            recs = [_run(g) for _, g in to_score]
-        for (key, g), rec in zip(to_score, recs):
+            out = [_run(g) for _, g in to_score]
+        for (key, g), (rec, row) in zip(to_score, out):
             self.evals += 1
-            self.members[key] = {"subs": g, "recovered": rec, "gen": gen}
-            results[key] = rec
+            self._record(key, g, rec, row, gen)
+            results[key] = self.members[key]["recovered"]
         return results
 
     def scored(self) -> list:
         return [m for m in self.members.values() if m["recovered"] is not None]
 
+    def lcb(self, m) -> float:
+        """Pessimistic score (commit): a noisy member is charged for its noise."""
+        return m["recovered"] + self.z_commit * m.get("sem", 0.0)
+
+    def ucb(self, m) -> float:
+        """Optimistic score (explore): a noisy member keeps its benefit of doubt,
+        so it stays elite long enough to be re-measured rather than being
+        dismissed -- or crowned -- on one draw."""
+        return m["recovered"] - self.z_explore * m.get("sem", 0.0)
+
     def best(self):
+        """The genome we would COMMIT to (finalist / believed-number fold)."""
         v = self.scored()
-        return min(v, key=lambda m: m["recovered"]) if v else None
+        return min(v, key=self.lcb) if v else None
+
+    def leader(self):
+        """The genome at the head of the optimistic order -- the incumbent the
+        elite block shows and the one worth re-measuring."""
+        v = self.scored()
+        return min(v, key=self.ucb) if v else None
 
     def best_recovered(self):
         b = self.best()
         return b["recovered"] if b else None
 
     def elite(self, frac: float, min_n: int = 2, max_n: int = 12) -> list:
-        """Top-q elite by recovered (most negative first)."""
-        v = sorted(self.scored(), key=lambda m: m["recovered"])
+        """Top-q elite in OPTIMISTIC order (mean - z*sem, most negative first)."""
+        v = sorted(self.scored(), key=self.ucb)
         if not v:
             return []
         n = max(min_n, int(round(frac * len(v))))
         return v[: min(max_n, min(n, len(v)))]
 
+    def tried(self, exclude_keys=(), limit: int = 14) -> list:
+        """Scored members NOT in `exclude_keys`, worst-first -- the failure memory
+        the LLM brief was missing. Showing only the elite left the model blind to
+        what it had already tried and lost: 34-45% of its proposals re-proposed a
+        genome already in the pool, and it fixated on the incumbent's positions
+        (on 1elr, 6 of 7 post-seed proposals carried the elite's `1:Q`)."""
+        ex = set(exclude_keys)
+        v = [m for m in self.scored() if S.subs_key(m["subs"]) not in ex]
+        v.sort(key=lambda m: -m["recovered"])     # worst (least negative) first
+        return v[:limit]
+
 
 # ---------------------------------------------------------------------------
 # Random-EA operator (the matched control): crossover + point mutation.
 # ---------------------------------------------------------------------------
+
+def _regret(best, opt) -> float | None:
+    """How far the arm's best genome is from the fitness's KNOWN optimum.
+
+    Both are in the loop's more-negative-is-better convention, so regret is
+    `best - optimum` and is >= 0, with 0.0 meaning the arm found the exact
+    optimum. None whenever the evaluator cannot supply an optimum -- which is
+    every evaluator except the PLL table, and the reason this project has never
+    been able to say how good its searches actually are.
+    """
+    if best is None or not opt:
+        return None
+    return round(float(best) - float(opt["fitness"]), 4)
+
 
 def _rank_weights(n: int) -> list:
     """Linear rank weights, best (index 0) heaviest -- the fitness-proportional
@@ -272,18 +399,35 @@ def _point_mutate(d: dict, t, k_mut: int, iface, rng, p=0.7) -> dict:
     return d
 
 
-def ea_offspring(elite, t, k_mut: int, iface, rng, m: int) -> list:
+def ea_offspring(elite, t, k_mut: int, iface, rng, m: int, known=()) -> list:
     """m children, each (genome, parent_recovered) where parent is the better of
-    its two crossover parents -- the frontier that child is asked to beat."""
-    out = []
+    its two crossover parents -- the frontier that child is asked to beat.
+
+    `known` is every genome already evaluated. A child that repeats one is
+    RESAMPLED, exactly as a repeated LLM proposal is re-asked: crossover between
+    similar elites collides often, and without this the EA quietly produces fewer
+    distinct evaluations than the LLM arm (measured 18 vs 24 of a 24 budget on a
+    dry run) -- which would hand the LLM arm extra oracle calls and void the
+    matched-budget comparison. Capped resampling, so a saturated neighbourhood
+    still returns a child rather than spinning."""
+    out, known = [], set(known)
     for _ in range(m):
         p = _sample_parents(elite, rng, k=2)
         if not p:
             break
-        child = _crossover(p[0]["subs"], p[1]["subs"], k_mut, rng)
-        child = _point_mutate(child, t, k_mut, iface, rng)
         parent_rec = min(pp["recovered"] for pp in p)   # the stronger parent
-        out.append((_norm(child.items()), parent_rec))
+        child = None
+        for _try in range(8):
+            d = _crossover(p[0]["subs"], p[1]["subs"], k_mut, rng)
+            cand = _norm(_point_mutate(d, t, k_mut, iface, rng).items())
+            if S.subs_key(cand) not in known:
+                child = cand
+                break
+            p = _sample_parents(elite, rng, k=2) or p   # try a different pairing
+        if child is None:
+            child = cand                                 # neighbourhood saturated
+        known.add(S.subs_key(child))
+        out.append((child, parent_rec))
     return out
 
 
@@ -291,57 +435,182 @@ def ea_offspring(elite, t, k_mut: int, iface, rng, m: int) -> list:
 # LLM operator: show the elite WITH their proxy fitness; ask for better sets.
 # ---------------------------------------------------------------------------
 
-def _elite_block(elite) -> str:
-    rows = ["  rank  recovered(REU)  substitutions (pos:AA)",
-            "  ----  --------------  ----------------------"]
-    for r, m in enumerate(elite, 1):
-        sk = S.subs_key(m["subs"]) or "(none / wild-type)"
-        rows.append(f"  {r:4d}  {m['recovered']:+14.2f}  {sk}")
+# ---------------------------------------------------------------------------
+# WHAT THE IN-LOOP FITNESS ACTUALLY IS.
+#
+# Three evaluators now exist and they do not measure the same thing or even share
+# a unit. The brief has to say which one the model is being graded by, because
+# telling it the wrong one handicaps the LLM arm against the random-EA control,
+# which reads no brief at all and so cannot be misled. This table is the single
+# place that mapping lives; `scorer_objective` resolves a scorer to one entry.
+# ---------------------------------------------------------------------------
+OBJECTIVES = {
+    "proxy": dict(
+        units="REU",
+        system_attr="MUT_SYSTEM",
+        scored_by=(
+            "Candidates are scored by RECOVERED BINDING ENERGY (energy-weighted "
+            "interface retention x native dG, REU). MORE NEGATIVE IS BETTER -- "
+            "more of the interface energy kept on a ring that closes."),
+        propose_mode=(
+            "Keep the NATIVE BINDING MODE (the scorer repacks locally; it cannot "
+            "reward a changed fold)."),
+    ),
+    "folded": dict(
+        units="REU",
+        system_attr="MUT_SYSTEM_FOLDED",
+        scored_by=(
+            "Candidates are scored by the REAL FOLDED binding energy: the "
+            "cyclized peptide is folded from its sequence (backbone held at the "
+            "retained window), and the predicted ring's receptor interface is "
+            "scored (structure prediction x4 -> Rosetta dG, REU, median over "
+            "folds). MORE NEGATIVE IS BETTER."),
+        propose_mode=(
+            "Your edits are judged on the complex they fold into, so a change "
+            "that improves how the peptide folds or binds is rewarded -- not "
+            "only local interface tweaks."),
+    ),
+    "pll": dict(
+        units="nats/res",
+        system_attr="MUT_SYSTEM_PLL",
+        scored_by=(
+            "Candidates are scored by POSE-CONDITIONED INTERFACE LIKELIHOOD: an "
+            "inverse-folding model reads the deposited complex (receptor backbone "
+            "and side chains, peptide BACKBONE ONLY) and reports, per position, "
+            "the log-odds of the residue you put there against its background "
+            "frequency, averaged over the peptide. The number below is that "
+            "average NEGATED, so that -- as in every other column in this "
+            "project -- MORE NEGATIVE IS BETTER. Units are nats/residue, not "
+            "REU, and a difference of 0.05 is real: the score is exact, with no "
+            "measurement noise at all."),
+        propose_mode=(
+            "The score reads only how well each residue suits the pocket it "
+            "faces in the FIXED deposited pose. It cannot see strain, packing "
+            "clashes, or a changed fold, so a bulky residue earns nothing for "
+            "being bulky -- only for matching the shape and chemistry of the "
+            "receptor atoms across from it."),
+    ),
+}
+
+
+def scorer_objective(scorer) -> dict:
+    """Resolve an evaluator to its OBJECTIVES entry.
+
+    Keyed on the scorer's own declared `name`, falling back to the historical
+    `folds`/`is_gpu` sniffing so the pre-existing evaluators and the GPU-less
+    test doubles that only set `is_gpu` keep resolving exactly as before.
+    """
+    name = getattr(scorer, "name", None)
+    if name == "pll":
+        return OBJECTIVES["pll"]
+    folded = bool(getattr(scorer, "folds", getattr(scorer, "is_gpu", False)))
+    return OBJECTIVES["folded" if folded else "proxy"]
+
+
+def scorer_name(scorer) -> str:
+    """The short evaluator tag written into finalist rows ('proxy'/'boltz'/'pll')."""
+    name = getattr(scorer, "name", None)
+    if name:
+        return str(name)
+    return "boltz" if getattr(scorer, "is_gpu", False) else "proxy"
+
+
+def _elite_block(elite, noisy: bool = False, units: str = "REU") -> str:
+    """The frontier. With a stochastic evaluator each score carries its standard
+    error and how many independent measurements it rests on, so the model can see
+    that a 1 REU lead backed by one noisy draw is not a lead."""
+    if noisy:
+        rows = [f"  rank  score({units})   +/-SE   n  substitutions (pos:AA)",
+                "  ----  ----------  ------  --  ----------------------"]
+        for r, m in enumerate(elite, 1):
+            sk = S.subs_key(m["subs"]) or "(none / wild-type)"
+            rows.append(f"  {r:4d}  {m['recovered']:+10.2f}  {m.get('sem', 0.0):6.2f}  "
+                        f"{len(m.get('obs') or [1]):2d}  {sk}")
+    else:
+        rows = [f"  rank  score({units})  substitutions (pos:AA)",
+                "  ----  --------------  ----------------------"]
+        for r, m in enumerate(elite, 1):
+            sk = S.subs_key(m["subs"]) or "(none / wild-type)"
+            rows.append(f"  {r:4d}  {m['recovered']:+14.2f}  {sk}")
     return "\n".join(rows)
 
 
-def iter_brief(t, window, k_mut, elite, m, gen, wt_ala=None, folded=False) -> str:
+def _tried_block(tried) -> str:
+    """The failure memory: sets already measured that did NOT make the frontier."""
+    if not tried:
+        return ""
+    cells = [f"{S.subs_key(m['subs']) or '(none)'} ({m['recovered']:+.1f})"
+             for m in tried]
+    return ("Already measured and NOT on the frontier -- do not propose these "
+            "again, and do not simply vary the same one position:\n  "
+            + "; ".join(cells) + "\n\n")
+
+
+def iter_brief(t, window, k_mut, elite, m, gen, wt_ala=None, folded=False,
+               tried=(), noise_sd: float = 0.0, wt_score=None,
+               objective=None) -> str:
     a, b = window["a"], window["b"]
     note = (" The bindE column is each residue's current interface energy "
             "(more positive = it carries more binding)." if wt_ala else "")
+    # `objective` is the explicit form; `folded` is kept as the legacy selector so
+    # existing callers and tests are unaffected.
+    obj = objective or OBJECTIVES["folded" if folded else "proxy"]
+    units = obj["units"]
     # The in-loop fitness differs by evaluator, and the brief must describe the
     # REAL objective: the proxy threads onto the fixed native pose (edits cannot
     # change the fold), whereas the folded scorer re-folds the mutant (edits that
     # change folding/binding are exactly what is rewarded). Telling the model the
     # wrong one handicaps it versus the random-EA control, which reads no brief.
-    if folded:
-        scored_by = (
-            "These are the best substitution sets found so far, scored by the REAL "
-            "FOLDED binding energy: the cyclized peptide is folded from its sequence "
-            "(backbone held at the retained window), and the predicted ring's "
-            "receptor interface is scored (structure prediction x4 -> Rosetta dG, "
-            "REU, median over folds). MORE NEGATIVE IS BETTER.")
-        propose_mode = (
-            "Your edits are judged on the complex they fold into, so a change that "
-            "improves how the peptide folds or binds is rewarded -- not only local "
-            "interface tweaks.")
-    else:
-        scored_by = (
-            "These are the best substitution sets found so far, scored by RECOVERED "
-            "BINDING ENERGY (energy-weighted interface retention x native dG, REU). "
-            "MORE NEGATIVE IS BETTER -- more of the interface energy kept on a ring "
-            "that closes.")
-        propose_mode = (
-            "Keep the NATIVE BINDING MODE (the scorer repacks locally; it cannot "
-            "reward a changed fold).")
+    scored_by, propose_mode = obj["scored_by"], obj["propose_mode"]
+    # Tell the model the score is a MEASUREMENT. Without this it reads a 1 REU
+    # lead as a result and spends the next generation polishing it -- which is
+    # exactly what the first real-score run did (1bjr gen 2: six proposals, all
+    # single substitutions at the incumbent's position 2).
+    noise = ""
+    if noise_sd > 0:
+        noise = (
+            f"IMPORTANT -- these scores are NOISY MEASUREMENTS, not exact values: "
+            f"repeat measurement of the same sequence moves it by about "
+            f"{noise_sd:.1f} {units} (see the +/-SE column). Two sets within ~"
+            f"{2 * noise_sd:.1f} {units} of each other are TIED, not ranked. Do not "
+            f"chase a lead smaller than that; look for an edit that should be "
+            f"clearly better for a structural reason.\n\n")
+    # The exploration floor. Pure local refinement around the incumbent is how the
+    # loop stalled: >90% of offspring failed to beat the frontier they were shown
+    # and the best genome was already found by generation 1 in 9 of 16 runs.
+    n_new_pos = max(1, m // 2)
+    elite_pos = sorted({int(i) for mm in elite for i, _ in mm["subs"]})
+    pos_note = (f"Positions already on the frontier: "
+                f"{', '.join(str(i) for i in elite_pos)}. " if elite_pos else "")
     return (
         f"Generation {gen}. Peptide length {t.length} (indices 0..{t.length-1}), "
         f"{t.n_contacts} interface contacts. On cyclization the residues in window "
         f"[{a},{b}] are HELD at their bound pose and keep the interface; residues "
         f"outside are released so the ring can close.\n\n"
         f"Per-residue table:{note}\n{S._residue_table(t, wt_ala)}\n\n"
-        f"{scored_by} '(none)' is the wild-type sequence, the bar to beat:\n\n"
-        f"{_elite_block(elite)}\n\n"
+        # The wild-type is THE bar (every headline number is paired against
+        # nomut), but it is often not in the elite -- naming it as "the row marked
+        # (none)" then points at a row that is not on screen.
+        f"{scored_by}\n\n"
+        + (f"The wild-type peptide, unmodified, scores {wt_score:+.2f} {units}. "
+           f"That is the bar every candidate is measured against.\n\n"
+           if isinstance(wt_score, (int, float)) else
+           "'(none)' below is the wild-type sequence, the bar to beat.\n\n")
+        + f"Best substitution sets found so far:\n\n"
+        f"{_elite_block(elite, noisy=noise_sd > 0, units=units)}\n\n"
+        f"{_tried_block(tried)}"
+        f"{noise}"
         f"Study what the strong sets share and where the weak ones waste edits, "
         f"then propose {m} NEW candidate substitution set(s) that you expect to "
         f"score MORE NEGATIVE than the best above. Each set uses at most {k_mut} "
-        f"substitution(s). {propose_mode} Vary the sets; small, targeted changes "
-        f"to the strong sets usually beat starting over.\n\n"
+        f"substitution(s). {propose_mode}\n\n"
+        f"Requirements for the {m} sets:\n"
+        f"- Every set must be one NOT listed anywhere above.\n"
+        f"- At least {n_new_pos} of them must edit a position that is NOT on the "
+        f"frontier. {pos_note}The frontier may be sitting on a measurement "
+        f"artifact, so part of the budget has to test elsewhere.\n"
+        f"- Spread the rest: refine the strong sets, but no two of your sets "
+        f"should differ only in the amino acid at one shared position.\n\n"
         f"Output EXACTLY {m} line(s), each one candidate and nothing else:\n"
         f"<mut>pos:AA,pos:AA</mut>   (0-indexed position, one-letter amino acid), "
         f"or <mut>none</mut> for the wild-type."
@@ -382,18 +651,32 @@ def parse_many(text: str, L: int, k_mut: int, m: int) -> list:
 
 
 def llm_offspring(llm, t, window, k_mut, elite, m, gen, wt_ala, meta, rng,
-                  iface, max_retries=1, save_raw=False, folded=False) -> list:
+                  iface, max_retries=1, save_raw=False, folded=False,
+                  known=(), tried=(), noise_sd: float = 0.0, wt_score=None,
+                  objective=None) -> list:
     """One LLM call returning up to m new genomes, each paired with the best elite
     recovered shown (the frontier it was asked to beat). Falls back to a random-EA
     child if the model declines/malforms, so a dead generation does not stall the
-    loop (recorded in meta['llm_status'] counts)."""
+    loop (recorded in meta['llm_status'] counts).
+
+    `known` is every genome key already in the population. Proposals that repeat
+    one are DROPPED, not scored: a repeat costs the generation a proposal slot and
+    teaches the search nothing (measured at 34-45% of all LLM proposals). When
+    repeats leave the generation short, the model is re-asked ONCE with the
+    repeats named -- a cheap, in-context correction -- before the EA fallback."""
     from lp2cp.enums import StepStatus
 
     best_rec = elite[0]["recovered"] if elite else None
-    brief = iter_brief(t, window, k_mut, elite, m, gen, wt_ala=wt_ala, folded=folded)
-    system = S.MUT_SYSTEM_FOLDED if folded else S.MUT_SYSTEM
+    obj = objective or OBJECTIVES["folded" if folded else "proxy"]
+    brief = iter_brief(t, window, k_mut, elite, m, gen, wt_ala=wt_ala, folded=folded,
+                       tried=tried, noise_sd=noise_sd, wt_score=wt_score,
+                       objective=obj)
+    # The system prompt has to describe the same fitness as the brief, or the model
+    # reasons about a scorer it is not being graded by.
+    system = getattr(S, obj["system_attr"], S.MUT_SYSTEM)
     msgs = [{"role": "user", "content": brief}]
-    genomes = []
+    known = set(known)
+    fresh, seen_keys = [], set()
     status = "malformed"
     for r in range(max_retries + 1):
         reply = llm.complete(system, msgs)
@@ -407,16 +690,35 @@ def llm_offspring(llm, t, window, k_mut, elite, m, gen, wt_ala, meta, rng,
             break
         if save_raw:
             meta.setdefault("llm_raw", []).append((reply.text or "")[:600])
-        genomes = parse_many(reply.text, t.length, k_mut, m)
-        if genomes:
-            status = "ok"
+        parsed = parse_many(reply.text, t.length, k_mut, m)
+        repeats = []
+        for g in parsed:
+            key = S.subs_key(g)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            if key in known:
+                repeats.append(key or "(none)")
+                meta["n_dup_proposed"] = meta.get("n_dup_proposed", 0) + 1
+                continue
+            fresh.append(g)
+        if parsed:
+            status = "ok" if fresh else "all_duplicates"
+        if len(fresh) >= m or r >= max_retries:
             break
-        if r < max_retries:
-            msgs += [{"role": "assistant", "content": reply.text},
-                     {"role": "user", "content":
-                      f"Could not parse. Output exactly {m} line(s), each "
-                      "<mut>pos:AA,pos:AA</mut> or <mut>none</mut>, nothing else."}]
+        # Short this generation: say exactly why and ask again, once.
+        if repeats:
+            why = ("Those were already measured: " + ", ".join(repeats[:8]) +
+                   ". Repeats are discarded. ")
+        else:
+            why = "Could not parse. "
+        msgs += [{"role": "assistant", "content": reply.text},
+                 {"role": "user", "content":
+                  f"{why}Give {m - len(fresh)} DIFFERENT substitution set(s) that "
+                  f"appear nowhere above, each as <mut>pos:AA,pos:AA</mut> (or "
+                  f"<mut>none</mut>), one per line and nothing else."}]
     meta["status_counts"][status] = meta["status_counts"].get(status, 0) + 1
+    genomes = fresh[:m]
     if not genomes:   # keep the loop moving with a random child this generation
         genomes = [g for g, _ in ea_offspring(elite, t, k_mut, iface, rng, 1)]
         meta["fallback_gens"] = meta.get("fallback_gens", 0) + 1
@@ -429,8 +731,11 @@ def llm_offspring(llm, t, window, k_mut, elite, m, gen, wt_ala, meta, rng,
 
 def _seed_population(pop: Population, t, k_mut, iface, rng, n_seed, n_workers=1):
     """Initial pool: wild-type + random single/double mutants, scored under the
-    budget (the new ones in parallel). Shared seeding keeps the two arms' starting
-    pools comparable."""
+    budget (the new ones in parallel).
+
+    `rng` MUST be the arm-independent seeding RNG (see `evolve`): every arm has to
+    start from the SAME pool or the matched-budget comparison is confounded before
+    an operator has proposed anything."""
     seeds = [[]]
     tried = {S.subs_key([])}
     guard = 0
@@ -452,43 +757,107 @@ def _seed_population(pop: Population, t, k_mut, iface, rng, n_seed, n_workers=1)
 
 def evolve(arm, t, window, cache, *, k_mut, n_seed, n_gen, m_off, max_evals,
            elite_frac, relax_repeats, timeout, llm=None, wt_ala=None,
-           max_retries=1, save_raw=False, n_workers=1, scorer=None):
+           max_retries=1, save_raw=False, n_workers=1, scorer=None,
+           z_explore=1.0, z_commit=1.0, reassess=True):
     """Run one arm on one target. Returns (population, trajectory, meta). `scorer`
     is the pluggable evaluator (proxy by default; a BoltzScorer for real-score-in-
     loop). A GPU scorer saturates the one GPU, so its folds run serially."""
     iface = _iface_positions(t)
-    seed = int.from_bytes(hashlib.sha256(
-        f"{t.target_id}|{arm}|{k_mut}".encode()).digest()[:8], "big")
-    rng = random.Random(seed)
+    # TWO RNGs, and the split is load-bearing.
+    #   seed_rng is keyed WITHOUT the arm, so iter-ea and iter-llm* start from an
+    #   IDENTICAL random pool and the matched-budget comparison is paired. Keying
+    #   it on the arm (what this did before) handed each arm a different starting
+    #   point: measured mean seed-pool gap between arms 7.66 REU, up to 19.7 on
+    #   1jrr -- several times the arm difference the experiment is trying to read.
+    #   op_rng is keyed WITH the arm, so the EA's operator draws stay independent
+    #   of the LLM arm's fallback draws and each arm still replays deterministically.
+    seed_rng = random.Random(int.from_bytes(hashlib.sha256(
+        f"{t.target_id}|seed|{k_mut}|{n_seed}".encode()).digest()[:8], "big"))
+    rng = random.Random(int.from_bytes(hashlib.sha256(
+        f"{t.target_id}|{arm}|{k_mut}".encode()).digest()[:8], "big"))
     # Does the in-loop scorer re-fold the mutant? If so the LLM brief must describe
     # the folded objective, not the fixed-pose proxy. `folds` is the explicit flag;
     # fall back to is_gpu (BoltzScorer / the GPU fake both re-fold) if unset.
     folded = bool(getattr(scorer, "folds", getattr(scorer, "is_gpu", False)))
+    noisy = bool(getattr(scorer, "stochastic", False))
+    objective = scorer_objective(scorer)
     if getattr(scorer, "is_gpu", False):
         n_workers = 1
+    # THE KNOWN OPTIMUM, when the evaluator can supply one. An exactly solvable
+    # fitness (the additive per-position PLL table) turns "which arm scored
+    # better" into "which arm reached the optimum, and in how many evaluations" --
+    # a regret with a real zero. Computed ONCE per (target, arm), outside the
+    # budget, because reading it off the table is not an evaluation. No previous
+    # in-loop fitness in this project could support this measurement.
+    opt = None
+    opt_fn = getattr(scorer, "optimum", None)
+    if callable(opt_fn):
+        try:
+            # `iface` is exactly the set `_point_mutate` draws new positions
+            # from, so the optimum is graded inside the operator's action space.
+            opt = opt_fn(t, k_mut, window=window, mutable=iface)
+        except Exception as exc:  # noqa: BLE001  a diagnostic must never fail a run
+            print(f"[seqmut-iter] {t.target_id} optimum unavailable: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
     pop = Population(t, window, cache, k_mut, relax_repeats, timeout, max_evals,
-                    scorer=scorer)
+                    scorer=scorer, z_explore=z_explore, z_commit=z_commit)
     meta = {"llm_calls": 0, "llm_cost_usd": 0.0, "status_counts": {},
             "model_id": getattr(llm, "model_id", None) if llm else None}
 
-    _seed_population(pop, t, k_mut, iface, rng, n_seed, n_workers=n_workers)
+    if opt:
+        meta["optimum"] = opt
+        print(f"[seqmut-iter] {t.target_id:8s} {arm:12s} KNOWN OPTIMUM "
+              f"fitness={opt['fitness']:+.4f} (wt {opt['wt_fitness']:+.4f}) "
+              f"subs={opt['subs']} over {opt.get('n_mutable')} mutable "
+              f"position(s) -- the search is graded by regret against this"
+              + (f"; unrestricted the metric would pick {opt['free_subs']} at "
+                 f"{opt['free_fitness']:+.4f}, which the operator cannot reach"
+                 if opt.get("free_minus_constrained") else ""),
+              flush=True)
+
+    _seed_population(pop, t, k_mut, iface, seed_rng, n_seed, n_workers=n_workers)
     traj = [{"gen": 0, "evals": pop.evals, "best_recovered": pop.best_recovered(),
-             "pop": len(pop.scored()), "phase": "seed"}]
+             "pop": len(pop.scored()), "phase": "seed",
+             "regret": _regret(pop.best_recovered(), opt)}]
 
     for gen in range(1, n_gen + 1):
         if not pop.budget_left():
             break
+        # Re-measure the incumbent BEFORE proposing against it. One unit of the
+        # same budget both arms spend, and the only thing that stops a lucky draw
+        # from owning the frontier for the rest of the run. `shift` is the live
+        # readout of the optimizer's curse: positive = the leader got worse once
+        # measured again.
+        shift = None
+        if reassess and noisy:
+            shift = pop.reassess(pop.leader(), gen)
+            if not pop.budget_left():
+                break
         elite = pop.elite(elite_frac)
         if not elite:
             break
         frontier = elite[0]["recovered"]
+        # MAX elite SEM, not mean/median, on purpose: the quantity feeds a "these
+        # two are TIED" statement, and the measured failure is fixation on a
+        # sub-noise lead, so over-declaring ties pushes the model toward the
+        # exploration it was not doing. Erring the other way reproduces the bug.
+        noise_sd = (max((m.get("sem", 0.0) for m in elite), default=0.0)
+                    if noisy else 0.0)
         if arm in ITER_LLM_ARMS:
+            elite_keys = {S.subs_key(m["subs"]) for m in elite}
+            wt_m = pop.members.get(S.subs_key([]))
             children = llm_offspring(llm, t, window, k_mut, elite, m_off, gen,
                                      wt_ala, meta, rng, iface,
                                      max_retries=max_retries, save_raw=save_raw,
-                                     folded=folded)
+                                     folded=folded,
+                                     known=set(pop.members),
+                                     tried=pop.tried(exclude_keys=elite_keys),
+                                     noise_sd=noise_sd,
+                                     wt_score=(wt_m or {}).get("recovered"),
+                                     objective=objective)
         else:
-            children = ea_offspring(elite, t, k_mut, iface, rng, m_off)
+            children = ea_offspring(elite, t, k_mut, iface, rng, m_off,
+                                    known=set(pop.members))
 
         # scan the generation's NEW offspring in parallel (independent genomes);
         # budget + diagnostics are identical to the serial path.
@@ -509,6 +878,7 @@ def evolve(arm, t, window, cache, *, k_mut, n_seed, n_gen, m_off, max_evals,
                 improved_parent += 1
 
         best_after = pop.best_recovered()
+        bm = pop.best()
         traj.append({
             "gen": gen, "evals": pop.evals, "pop": len(pop.scored()),
             "frontier_shown": round(frontier, 3),
@@ -520,6 +890,15 @@ def evolve(arm, t, window, cache, *, k_mut, n_seed, n_gen, m_off, max_evals,
             "beat_frontier_rate": round(beat_frontier / scored_this, 3) if scored_this else 0.0,
             # fraction that beat their own parent (local refinement):
             "refine_rate": round(improved_parent / scored_this, 3) if scored_this else 0.0,
+            # noise bookkeeping: how far the re-measured leader moved (the live
+            # optimizer's-curse readout), and how well-measured the committed best is
+            "incumbent_shift": shift,
+            "best_sem": None if bm is None else round(bm.get("sem", 0.0), 3),
+            "best_n_obs": None if bm is None else len(bm.get("obs") or []),
+            "n_dup_proposed": meta.get("n_dup_proposed", 0),
+            # distance from the KNOWN optimum (None when the fitness has no
+            # closed-form optimum); 0.0 means this arm has solved the target
+            "regret": _regret(best_after, opt),
         })
     return pop, traj, meta
 
@@ -558,18 +937,39 @@ def _finalist_row(t, arm, window, cache, pop, traj, meta, k_mut, relax_repeats,
     best = pop.best()
     subs = list(best["subs"]) if best else []
     a, b = window["a"], window["b"]
-    if getattr(pop.scorer, "is_gpu", False):
-        # Real-score-in-loop: the finalist's in-loop number is already a Boltz dG;
-        # do NOT recompute the Rosetta proxy. Build the row from the best genome so
-        # the believed-number report re-folds it with an INDEPENDENT draw.
+    name = scorer_name(pop.scorer)
+    if name != "proxy":
+        # The in-loop number is already the fitness we selected on; do NOT
+        # recompute the Rosetta proxy. Build the row from the best genome so the
+        # believed-number report re-folds it with an INDEPENDENT draw.
+        obj = scorer_objective(pop.scorer)
+        best_rec = pop.best_recovered()
+        # Whether the in-loop fitness may be written into
+        # `recovered_binding_energy` AT ALL. The Boltz fitness is a Rosetta
+        # energy, so it belongs there; the PLL fitness is nats/residue, and
+        # putting it there would silently pool two different units in the same
+        # report column -- the exact class of mistake that produced this
+        # project's "interface dG measures size" result. It stays out, under its
+        # own key, and the report re-folds the finalist for the REU number.
+        is_reu = bool(getattr(pop.scorer, "is_reu", True))
         row = {"target_id": t.target_id, "mut_arm": arm, "length": t.length,
                "k_mut": k_mut, "subs": [[int(i), aa.upper()] for i, aa in subs],
                "subs_key": S.subs_key(subs), "committed_window": [a, b],
                "window_clean": window.get("clean"),
                "contact_retention": round(window.get("retention", 0.0), 4),
                "native_dG": None, "energy_retention": None,
-               "recovered_binding_energy": pop.best_recovered(),
-               "inloop_evaluator": "boltz", "inloop_dG": pop.best_recovered()}
+               "recovered_binding_energy": best_rec if is_reu else None,
+               "inloop_evaluator": name,
+               "inloop_fitness": best_rec,
+               "inloop_units": obj["units"]}
+        if name == "boltz":
+            row["inloop_dG"] = best_rec          # the pre-existing key, unchanged
+        if name == "pll" and best_rec is not None:
+            # the metric in ITS OWN orientation (higher = better), beside the
+            # negated fitness, so no consumer has to guess which way round it is
+            row["inloop_pll"] = round(-float(best_rec), 6)
+            row["inloop_metric"] = getattr(pop.scorer, "metric", None)
+            row["inloop_scope"] = getattr(pop.scorer, "scope", None)
     else:
         row = S.score_target(t, arm, window, cache, k_mut, relax_repeats, timeout,
                              subs_override=subs)
@@ -578,10 +978,26 @@ def _finalist_row(t, arm, window, cache, pop, traj, meta, k_mut, relax_repeats,
         row["model_id"] = meta["model_id"]
     # arm accounting + the "good optimizer" trajectory summary
     gens = [d for d in traj if d.get("phase") != "seed"]
+    shifts = [d["incumbent_shift"] for d in gens if d.get("incumbent_shift") is not None]
     row["iter"] = {
         "n_evals": pop.evals, "n_gen_run": len(gens), "n_seed": traj[0]["pop"],
         "best_gen": best["gen"] if best else None,
         "best_recovered": pop.best_recovered(),
+        # how well-measured the committed finalist is, and what re-measuring the
+        # incumbent kept correcting -- the optimizer's-curse accounting
+        "best_sem": round(best.get("sem", 0.0), 3) if best else None,
+        "best_n_obs": len(best.get("obs") or []) if best else None,
+        "n_reassess": pop.reassessments,
+        # grading against the fitness's KNOWN optimum, when it has one. `regret`
+        # 0.0 = this arm found the exact best genome available under its Hamming
+        # budget; `evals_to_optimum` is how much of the budget that took.
+        "optimum": meta.get("optimum"),
+        "regret": _regret(pop.best_recovered(), meta.get("optimum")),
+        "evals_to_optimum": next(
+            (d["evals"] for d in traj
+             if d.get("regret") is not None and d["regret"] <= 0.0), None),
+        "mean_incumbent_shift": round(sum(shifts) / len(shifts), 3) if shifts else None,
+        "n_dup_proposed": meta.get("n_dup_proposed", 0),
         "seed_best": traj[0]["best_recovered"],
         "breakthrough_rate": round(sum(d["breakthrough"] for d in gens) / len(gens), 3) if gens else 0.0,
         "mean_beat_frontier": round(sum(d["beat_frontier_rate"] for d in gens) / len(gens), 3) if gens else 0.0,
@@ -593,6 +1009,12 @@ def _finalist_row(t, arm, window, cache, pop, traj, meta, k_mut, relax_repeats,
         row["llm_cost_usd"] = meta["llm_cost_usd"]
         row["llm_status"] = ("ok" if meta["status_counts"].get("ok") else
                              next(iter(meta["status_counts"]), "malformed"))
+        # --save-raw collected every reply; persist them or the flag does nothing
+        # (seqmut.py's single-shot path already writes llm_raw, this one dropped
+        # it). Needed to check the brief is actually obeyed -- that proposals stop
+        # repeating known sets and some of them leave the frontier's positions.
+        if meta.get("llm_raw"):
+            row["llm_raw"] = meta["llm_raw"]
     return row
 
 
@@ -657,6 +1079,17 @@ def run(args):
     # retention; boltz = real Boltz x4 -> Rosetta dG, shared across arms/targets
     # (cached by variant_id) so the matched budget and cross-arm reuse hold.
     scorer = None
+    if getattr(args, "evaluator", "proxy") == "pll":
+        from lnr.pll_inloop import PLLScorer
+        scorer = PLLScorer(
+            metric=args.pll_metric, scope=args.pll_scope,
+            model_name=args.pll_model, device=args.pll_device,
+            pssm_dir=(args.pll_pssm_dir or out.parent / "pssm"),
+            cache_path=(args.pll_cache or out.parent / "seqmut_iter_pll_scores.jsonl"))
+        print(f"[seqmut-iter] evaluator=pll metric={args.pll_metric} "
+              f"scope={args.pll_scope} model={args.pll_model} "
+              f"(deterministic, CPU; the optimum is known in closed form)",
+              flush=True)
     if getattr(args, "evaluator", "proxy") == "boltz":
         from lnr.boltz_inloop import BoltzScorer
         scorer = BoltzScorer(
@@ -683,6 +1116,19 @@ def run(args):
             print(f"[seqmut-iter] {t.target_id:8s} no closing window -- skipped",
                   flush=True)
             continue
+        # Let the evaluator pay its one-time per-target setup and declare the
+        # target usable BEFORE any budget is spent. Without this a scorer that
+        # cannot build a reference pose returns None for every genome, the arm
+        # burns its whole seed budget, and the log is indistinguishable from a
+        # search that simply found nothing.
+        prep = getattr(scorer, "prepare", None)
+        if callable(prep):
+            why = prep(t, win)
+            if why:
+                print(f"[seqmut-iter] {t.target_id:8s} evaluator "
+                      f"{scorer_name(scorer)} cannot score this target -- "
+                      f"skipped: {why}", flush=True)
+                continue
         wt = cache.get(t.target_id, [])
         wt_ala = (wt or {}).get("per_residue_ddG_ala")
         # The -ala arm needs the WT per-residue interface energies. In proxy mode
@@ -701,14 +1147,24 @@ def run(args):
         # N_cyc). Under the Boltz evaluator we DON'T compute the Rosetta proxy for
         # nomut -- the report re-folds it -- so we emit just the foldable stub.
         if (t.target_id, "nomut", None, args.k_mut) not in done:
-            if scorer is not None and getattr(scorer, "is_gpu", False):
+            if scorer is not None and scorer_name(scorer) != "proxy":
                 nrow = {"target_id": t.target_id, "mut_arm": "nomut",
                         "length": t.length, "k_mut": args.k_mut, "subs": [],
                         "subs_key": "", "committed_window": [win["a"], win["b"]],
                         "window_clean": win.get("clean"),
                         "contact_retention": round(win.get("retention", 0.0), 4),
                         "native_dG": None, "recovered_binding_energy": None,
+                        "inloop_evaluator": scorer_name(scorer),
                         "closure_arm": args.closure_arm}
+                # A deterministic, free evaluator CAN score the wild-type, and the
+                # wild-type is the bar every headline number is paired against --
+                # so record it rather than leaving the pairing base empty.
+                if not getattr(scorer, "is_gpu", False):
+                    f0, r0 = scorer.score(t, [], win)
+                    nrow["inloop_fitness"] = f0
+                    nrow["inloop_units"] = scorer_objective(scorer)["units"]
+                    if f0 is not None and scorer_name(scorer) == "pll":
+                        nrow["inloop_pll"] = round(-float(f0), 6)
             else:
                 nrow = S.score_target(t, "nomut", win, cache, args.k_mut,
                                       args.relax_repeats, args.per_target_timeout)
@@ -731,7 +1187,10 @@ def run(args):
                 llm=(llm if arm in ITER_LLM_ARMS else None),
                 wt_ala=(wt_ala if arm == "iter-llm-ala" else None),
                 max_retries=args.max_retries, save_raw=args.save_raw,
-                n_workers=args.n_workers, scorer=scorer)
+                n_workers=args.n_workers, scorer=scorer,
+                z_explore=getattr(args, "z_explore", 1.0),
+                z_commit=getattr(args, "z_commit", 1.0),
+                reassess=not getattr(args, "no_reassess", False))
             for d in traj:
                 d2 = dict(d, target_id=t.target_id, arm=arm, model_id=meta.get("model_id"))
                 tfh.write(json.dumps(d2) + "\n")
@@ -743,8 +1202,11 @@ def run(args):
             it = row["iter"]
             print(f"[seqmut-iter] {t.target_id:8s} {arm:12s} "
                   f"evals={it['n_evals']} gens={it['n_gen_run']} "
-                  f"best={it['best_recovered']} (seed {it['seed_best']}) "
+                  f"best={it['best_recovered']} +/-{it['best_sem']} "
+                  f"(n={it['best_n_obs']}, seed {it['seed_best']}) "
                   f"bt_rate={it['breakthrough_rate']} beat={it['mean_beat_frontier']} "
+                  f"reassess={it['n_reassess']}/shift={it['mean_incumbent_shift']} "
+                  f"dup={it['n_dup_proposed']} "
                   f"subs={row.get('subs')} ${it['llm_cost_usd']:.4f} "
                   f"{round(time.time()-t0)}s", flush=True)
     fh.close()
@@ -786,7 +1248,113 @@ def report_dir(d: Path):
     _summarize_rows(list(seen.values()))
 
 
+def _summarize_pll(rows):
+    """The report for a fitness measured in nats, not REU -- and graded against a
+    KNOWN optimum.
+
+    This table answers a question the REU table cannot even ask. The columns that
+    matter are `regret` (distance from the exact best <= k_mut substitution set,
+    0 = solved) and `solved` (the fraction of targets where the arm reached it).
+    An arm at regret 0 everywhere has not won the experiment -- it has shown the
+    INSTRUMENT IS SATURATED: the fitness is a sum of independent per-position
+    terms, so the optimum is the top-k per-position gains and any hill-climber
+    finds it. When both arms read 100% solved, the LLM-vs-EA comparison at this
+    k_mut is measuring nothing, and the next move is a non-separable objective,
+    not more budget.
+    """
+    pll = [r for r in rows if r.get("inloop_evaluator") == "pll"
+           and r.get("inloop_fitness") is not None]
+    if not pll:
+        return
+    by = {}
+    for r in pll:
+        by.setdefault(S._arm_label(r), {})[r.get("target_id")] = r
+    print("\n" + "=" * 110)
+    print("SEQMUT-ITER -- POSE-CONDITIONED LIKELIHOOD fitness (nats/residue, "
+          "NEGATED so more negative = better).")
+    print("regret = distance from the EXACT optimum under the Hamming budget; "
+          "0.0000 = the arm found it. solved = fraction of targets at regret 0.")
+    print("=" * 110)
+    print(f"{'arm':30s} {'n':>3s} {'meanFit':>9s} {'meanWT':>9s} {'gainVsWT':>9s} "
+          f"{'meanOpt':>9s} {'regret':>8s} {'solved':>7s} {'evals2opt':>10s} "
+          f"{'evals':>6s} {'cost$':>8s}")
+    wt_of = {r["target_id"]: r.get("inloop_fitness") for r in rows
+             if r.get("mut_arm") == "nomut" and r.get("inloop_fitness") is not None}
+    for label in sorted(by):
+        cells = list(by[label].values())
+        its = [c.get("iter") or {} for c in cells]
+        fit = [c["inloop_fitness"] for c in cells]
+        opts = [(i.get("optimum") or {}).get("fitness") for i in its]
+        opts = [o for o in opts if o is not None]
+        regs = [i.get("regret") for i in its if i.get("regret") is not None]
+        wts = [wt_of.get(c["target_id"]) for c in cells]
+        wts = [w for w in wts if w is not None]
+        e2o = [i.get("evals_to_optimum") for i in its
+               if i.get("evals_to_optimum") is not None]
+        mf = sum(fit) / len(fit)
+        mw = sum(wts) / len(wts) if wts else float("nan")
+        ev = sum(i.get("n_evals", 0) for i in its) / len(its) if its else 0
+        co = sum(i.get("llm_cost_usd", 0.0) or 0.0 for i in its)
+        # The nomut baseline carries no loop and therefore no optimum or regret.
+        # Printing nan there reads as a broken computation rather than as a
+        # column that does not apply, so it is dotted out.
+        mo = f"{sum(opts)/len(opts):9.4f}" if opts else f"{'.':>9s}"
+        mr = f"{sum(regs)/len(regs):8.4f}" if regs else f"{'.':>8s}"
+        sv = (f"{sum(1 for r in regs if r <= 0.0)/len(regs):7.0%}" if regs
+              else f"{'.':>7s}")
+        me = f"{sum(e2o)/len(e2o):10.1f}" if e2o else f"{'.':>10s}"
+        print(f"{label:30s} {len(cells):3d} {mf:9.4f} {mw:9.4f} "
+              f"{mf - mw:+9.4f} {mo} {mr} {sv} {me} {ev:6.0f} {co:8.3f}")
+    # Where the operator's ACTION SPACE, not the search, is the binding
+    # constraint: the graded optimum is restricted to the positions the operator
+    # may touch, so a target whose unrestricted optimum is better is one where no
+    # amount of searching could have reached the metric's own best edit. Reported
+    # because it changes what a regret of 0 means on that target.
+    gaps = [(tid, (c.get("iter") or {}).get("optimum") or {})
+            for lab, cs in by.items() if lab.split(":")[0] != "nomut"
+            for tid, c in cs.items()]
+    gaps = [(tid, o) for tid, o in gaps if o.get("free_minus_constrained")]
+    if gaps:
+        print(f"\n  ACTION SPACE binds on {len(gaps)} target(s): the metric's "
+              f"unrestricted best edit lies outside the positions the operator "
+              f"may change, so regret there is a bound, not a search failure.")
+        for tid, o in sorted(gaps)[:8]:
+            print(f"    {tid:8s} graded opt {o['subs']} {o['fitness']:+.4f} vs "
+                  f"free {o['free_subs']} {o['free_fitness']:+.4f} "
+                  f"(delta {o['free_minus_constrained']:+.4f})")
+
+    # The matched-budget control, on the fitness the arms were actually selected
+    # on. Reported over SHARED targets only, so it is paired.
+    # (not a comprehension with a shadowed name: `cells` and `row` stay distinct
+    # so the flattening is readable)
+    ea = {}
+    for lab, cells in by.items():
+        if lab.split(":")[0] == ITER_EA_ARM:
+            ea.update(cells)
+    for label in sorted(by):
+        if label.split(":")[0] not in ITER_LLM_ARMS:
+            continue
+        shared = sorted(set(ea) & set(by[label]))
+        if not shared:
+            continue
+        d = [by[label][k]["inloop_fitness"] - ea[k]["inloop_fitness"] for k in shared]
+        rl = [(by[label][k].get("iter") or {}).get("regret") for k in shared]
+        re_ = [(ea[k].get("iter") or {}).get("regret") for k in shared]
+        rl = [x for x in rl if x is not None]
+        re_ = [x for x in re_ if x is not None]
+        print(f"\n  CONTROL {label} vs {ITER_EA_ARM} on {len(shared)} shared "
+              f"target(s): mean delta fitness {sum(d)/len(d):+.4f} nats "
+              f"(negative = the LLM operator wins)")
+        if rl and re_:
+            print(f"    mean regret: LLM {sum(rl)/len(rl):.4f} vs "
+                  f"EA {sum(re_)/len(re_):.4f}"
+                  + ("   -- BOTH AT 0: the objective is separable and this "
+                     "comparison is saturated, not won"
+                     if max(rl) <= 0.0 and max(re_) <= 0.0 else ""))
+
+
 def _summarize_rows(rows):
+    _summarize_pll(rows)
     by = {}
     for r in rows:
         by.setdefault(S._arm_label(r), {})[r.get("target_id")] = r
@@ -801,14 +1369,21 @@ def _summarize_rows(rows):
     print("SEQMUT-ITER -- recovered binding energy (retention x native_dG), REU; "
           "more negative = stronger. CEIL = WT native_dG at retention=1.")
     print("=" * 110)
-    print(f"{'arm':30s} {'n':>3s} {'meanRecov':>10s} {'meanCeil':>9s} "
+    print(f"{'arm':30s} {'n':>3s} {'meanRecov':>10s} {'meanSEM':>8s} {'meanCeil':>9s} "
           f"{'%ceil':>6s} {'bestGen':>8s} {'btRate':>7s} {'beatFr':>7s} "
-          f"{'refine':>7s} {'evals':>6s} {'cost$':>8s}")
+          f"{'refine':>7s} {'shift':>7s} {'dup':>5s} {'evals':>6s} {'cost$':>8s}")
     for label in sorted(by):
         cells = list(by[label].values())
         v = [c for c in cells if c.get("recovered_binding_energy") is not None]
         if not v:
-            print(f"{label:30s} {len(cells):3d}  (no scored rows)")
+            # A non-REU in-loop fitness deliberately leaves this column empty
+            # rather than pooling two units in it; the number is in the table
+            # above, and the REU number comes from re-folding the finalist.
+            ev = {c.get("inloop_evaluator") for c in cells} - {None}
+            why = ("(fitness is not REU -- see the table above; the REU number "
+                   "comes from boltz_validate --mode mut-held)"
+                   if ev and all(e == "pll" for e in ev) else "(no scored rows)")
+            print(f"{label:30s} {len(cells):3d}  {why}")
             continue
         mr = sum(c["recovered_binding_energy"] for c in v) / len(v)
         cv = [ceil[c["target_id"]] for c in v if ceil.get(c["target_id"]) is not None]
@@ -822,10 +1397,17 @@ def _summarize_rows(rows):
             ev = sum(i["n_evals"] for i in its) / len(its)
             co = sum(i["llm_cost_usd"] for i in its)
             bg = sum((i["best_gen"] or 0) for i in its) / len(its)
-            print(f"{label:30s} {len(v):3d} {mr:10.2f} {mc:9.2f} {pc:6.0f} "
-                  f"{bg:8.1f} {bt:7.2f} {bf:7.2f} {rf:7.2f} {ev:6.0f} {co:8.3f}")
+            sems = [i.get("best_sem") for i in its if i.get("best_sem") is not None]
+            se = sum(sems) / len(sems) if sems else 0.0
+            shs = [i.get("mean_incumbent_shift") for i in its
+                   if i.get("mean_incumbent_shift") is not None]
+            sh = f"{sum(shs)/len(shs):+7.2f}" if shs else f"{'.':>7s}"
+            dup = sum(i.get("n_dup_proposed", 0) or 0 for i in its)
+            print(f"{label:30s} {len(v):3d} {mr:10.2f} {se:8.2f} {mc:9.2f} {pc:6.0f} "
+                  f"{bg:8.1f} {bt:7.2f} {bf:7.2f} {rf:7.2f} {sh} {dup:5d} "
+                  f"{ev:6.0f} {co:8.3f}")
         else:
-            print(f"{label:30s} {len(v):3d} {mr:10.2f} {mc:9.2f} {pc:6.0f} "
+            print(f"{label:30s} {len(v):3d} {mr:10.2f} {'':8s} {mc:9.2f} {pc:6.0f} "
                   f"  (baseline, no loop)")
 
     # Paired deltas vs the matching-closure nomut, and the KEY control: the LLM
@@ -895,12 +1477,47 @@ def main() -> int:
     ap.add_argument("--max-evals", type=int, default=40,
                     help="MATCHED budget: distinct proxy evaluations per (target,arm)")
     ap.add_argument("--elite-frac", type=float, default=0.3)
+    # Noisy-fitness controls. Only engaged by a stochastic evaluator (boltz); with
+    # the deterministic proxy sem==0 and all three are no-ops.
+    ap.add_argument("--z-explore", type=float, default=1.0,
+                    help="elite ranked OPTIMISTICALLY by mean - z*SEM, so a noisy "
+                         "candidate survives to be re-measured instead of being "
+                         "crowned or dismissed on one draw")
+    ap.add_argument("--z-commit", type=float, default=1.0,
+                    help="finalist chosen PESSIMISTICALLY by mean + z*SEM, so the "
+                         "genome we spend the real oracle on is not just the "
+                         "luckiest draw (the measured optimizer's curse: 61%% of "
+                         "the first run's apparent gain did not survive a redraw)")
+    ap.add_argument("--no-reassess", action="store_true",
+                    help="do NOT re-measure the incumbent each generation "
+                         "(restores the old behaviour: one draw owns the frontier "
+                         "for the whole run)")
     ap.add_argument("--n-workers", type=int, default=4,
                     help="parallel proxy scans per generation (<= cpus-per-task); "
                     "wall-clock only, never changes which genomes are evaluated")
-    ap.add_argument("--evaluator", default="proxy", choices=["proxy", "boltz"],
+    # The pose-conditioned-likelihood evaluator (CPU, deterministic, exactly
+    # solvable). See agent/lnr/pll_inloop.py for why it exists.
+    ap.add_argument("--pll-metric", default="pll_bg",
+                    choices=["pll_bg", "pll_cplx"],
+                    help="which form of the metric is the fitness; pll_bg is the "
+                         "pre-registered and graded one")
+    ap.add_argument("--pll-scope", default="all", choices=["all", "window", "iface"],
+                    help="positions the score averages over. 'all' is the GRADED "
+                         "form and the default; 'window'/'iface' are recorded in "
+                         "every row either way, so the comparison needs no rerun")
+    ap.add_argument("--pll-model", default="ligandmpnn_v_32_020_25")
+    ap.add_argument("--pll-device", default="cpu")
+    ap.add_argument("--pll-pssm-dir", default="",
+                    help="where per-target PSSM tables are cached (default "
+                         "<out dir>/pssm)")
+    ap.add_argument("--pll-cache", default="",
+                    help="jsonl of every scored sequence (default "
+                         "<out dir>/seqmut_iter_pll_scores.jsonl)")
+    ap.add_argument("--evaluator", default="proxy", choices=["proxy", "boltz", "pll"],
                     help="proxy = pose-preserving Rosetta retention (CPU, cheap); "
-                    "boltz = REAL Boltz x4 -> Rosetta dG in the loop (GPU, ~2min/cand)")
+                    "boltz = REAL Boltz x4 -> Rosetta dG in the loop (GPU, ~2min/cand); "
+                    "pll = pose-conditioned interface likelihood (CPU, ~30us/cand, "
+                    "bitwise deterministic, optimum known in closed form)")
     ap.add_argument("--boltz-replicas", type=int, default=4,
                     help="Boltz diffusion samples per candidate (the denoised unit)")
     ap.add_argument("--boltz-seed", type=int, default=1234,

@@ -1,0 +1,380 @@
+"""REGRET analysis for the pose-conditioned-likelihood in-loop fitness.
+
+Reads only saved artefacts (`seqmut_iter_pll_rows.jsonl`), so every number and
+table here is redrawable with no recomputation and no model -- the LNR
+convention. It exists because `--evaluator pll` is the first in-loop fitness in
+this project whose OPTIMUM IS KNOWN, which makes a question askable that was not
+askable before: not "which arm scored higher" but "how much of the reachable
+improvement did each arm actually capture, and what predicts failure".
+
+THE CONTROL THIS MODULE IS BUILT AROUND
+---------------------------------------
+Raw regret is in nats/residue and is NOT comparable across targets. `pll_bg` is a
+MEAN over peptide positions, so a fixed-k edit is diluted by 1/L: on the 79-target
+run, available gain falls with length at rho -0.681. Any raw regret-vs-length
+correlation is therefore fighting a size confound -- the same trap that produced
+this project's "interface dG measures size, not affinity" result. So the headline
+quantity is NORMALISED regret, `regret / available_gain`: the fraction of the
+reachable improvement the search failed to capture. Both are reported, next to the
+confound itself, and every correlation gets a permutation null rather than a
+parametric p -- here a plain shuffle, because one row per target really is
+independent (unlike the within-series pairs that needed a restricted permutation,
+[[pooled-pairs-need-a-permutation-null]]).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+import statistics as st
+import sys
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+for _p in (str(_HERE.parent),):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+LENGTH_BINS = ((0, 8), (9, 11), (12, 14), (15, 19), (20, 10**6))
+DISCRIMINATING_REGRET = 0.05
+
+
+# ---------------------------------------------------------------------------
+# statistics
+# ---------------------------------------------------------------------------
+def _ranks(v):
+    """Average ranks, so ties (and regret has many exact 0.0 ties) do not get an
+    arbitrary order that would inflate or deflate rho."""
+    order = sorted(range(len(v)), key=lambda i: v[i])
+    out = [0.0] * len(v)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and v[order[j + 1]] == v[order[i]]:
+            j += 1
+        mean_rank = (i + j) / 2.0
+        for k in range(i, j + 1):
+            out[order[k]] = mean_rank
+        i = j + 1
+    return out
+
+
+def pearson(a, b):
+    if len(a) < 2:
+        return 0.0
+    ma, mb = st.mean(a), st.mean(b)
+    num = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    den = math.sqrt(sum((x - ma) ** 2 for x in a) * sum((y - mb) ** 2 for y in b))
+    return num / den if den else 0.0
+
+
+def spearman(a, b):
+    return pearson(_ranks(a), _ranks(b))
+
+
+def perm_p(a, b, n=20000, seed=0):
+    """Two-sided permutation p for |rho|. Targets are independent rows, so the
+    null is a plain shuffle of one side."""
+    if len(a) < 3:
+        return float("nan")
+    obs = abs(spearman(a, b))
+    rng = random.Random(seed)
+    bb = list(b)
+    hits = 0
+    for _ in range(int(n)):
+        rng.shuffle(bb)
+        if abs(spearman(a, bb)) >= obs - 1e-12:
+            hits += 1
+    return (hits + 1) / (int(n) + 1)
+
+
+# ---------------------------------------------------------------------------
+# the rows
+# ---------------------------------------------------------------------------
+def load(path, arm=None):
+    """Graded rows from a seqmut-iter pll rows file: those carrying BOTH a regret
+    and the optimum it was measured against."""
+    out = []
+    for line in Path(path).read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        it = r.get("iter") or {}
+        if r.get("mut_arm") == "nomut" or it.get("regret") is None:
+            continue
+        if not it.get("optimum"):
+            continue
+        if arm and r.get("mut_arm") != arm:
+            continue
+        o = it["optimum"]
+        gain = abs(float(o["fitness"]) - float(o["wt_fitness"]))
+        out.append({
+            "target_id": r.get("target_id"),
+            "arm": r.get("mut_arm"),
+            "length": int(r.get("length") or 0),
+            "n_mutable": o.get("n_mutable") or int(r.get("length") or 0),
+            "regret": float(it["regret"]),
+            # fraction of the reachable improvement that was NOT captured
+            "norm_regret": (float(it["regret"]) / gain) if gain > 1e-9 else 0.0,
+            "gain": gain,
+            "solved": 1.0 if float(it["regret"]) <= 0.0 else 0.0,
+            "n_evals": it.get("n_evals"),
+            "n_gen_run": it.get("n_gen_run"),
+            "evals_to_optimum": it.get("evals_to_optimum"),
+            "action_space_binds": bool(o.get("free_minus_constrained")),
+        })
+    return out
+
+
+def arms(path):
+    return sorted({r["arm"] for r in load(path)})
+
+
+# ---------------------------------------------------------------------------
+# the tables
+# ---------------------------------------------------------------------------
+def by_length(rows, bins=LENGTH_BINS):
+    out = []
+    for lo, hi in bins:
+        g = [r for r in rows if lo <= r["length"] <= hi]
+        if not g:
+            continue
+        out.append({
+            "bin": f"{lo}-{hi}" if hi < 10 ** 6 else f"{lo}+",
+            "n": len(g),
+            "n_solved": int(sum(r["solved"] for r in g)),
+            "mean_regret": st.mean(r["regret"] for r in g),
+            "median_regret": st.median(r["regret"] for r in g),
+            "mean_norm_regret": st.mean(r["norm_regret"] for r in g),
+            "median_norm_regret": st.median(r["norm_regret"] for r in g),
+            "mean_gain": st.mean(r["gain"] for r in g),
+        })
+    return out
+
+
+def correlations(rows, n_perm=20000, seed=0):
+    """Every correlation WITH its size control beside it, never alone."""
+    L = [r["length"] for r in rows]
+    pairs = [
+        ("length vs regret (raw, nats)", [r["regret"] for r in rows]),
+        ("length vs regret / available gain", [r["norm_regret"] for r in rows]),
+        ("length vs available gain  (THE CONFOUND)", [r["gain"] for r in rows]),
+        ("length vs solved (0/1)", [r["solved"] for r in rows]),
+        ("n_mutable vs regret (raw)", None),
+    ]
+    out = []
+    for name, y in pairs:
+        x = L
+        if y is None:                      # the n_mutable row uses a different x
+            x = [r["n_mutable"] for r in rows]
+            y = [r["regret"] for r in rows]
+        out.append({"name": name, "rho": spearman(x, y),
+                    "perm_p": perm_p(x, y, n=n_perm, seed=seed), "n": len(rows)})
+    return out
+
+
+def discriminating(rows, thresh=DISCRIMINATING_REGRET):
+    """Targets where an arm left enough regret that a better operator could show
+    a difference -- the subset worth spending API budget on."""
+    hi = [r for r in rows if r["regret"] > thresh]
+    return [r["target_id"] for r in sorted(hi, key=lambda r: -r["regret"])]
+
+
+def budget_check(rows, max_evals=None):
+    """Was the search limited by its EVALUATION budget, or by its generations?
+    Answering this wrong turns an under-run into a claimed operator ceiling."""
+    ev = [r["n_evals"] for r in rows if r["n_evals"] is not None]
+    if not ev:
+        return {}
+    at_cap = (sum(1 for e in ev if max_evals and e >= max_evals)
+              if max_evals else None)
+    return {"mean_evals": st.mean(ev), "median_evals": st.median(ev),
+            "max_evals_used": max(ev), "min_evals_used": min(ev),
+            "n": len(ev), "cap": max_evals, "n_at_cap": at_cap}
+
+
+# ---------------------------------------------------------------------------
+# report
+# ---------------------------------------------------------------------------
+def report(path, out_json=None, thresh=DISCRIMINATING_REGRET, n_perm=20000,
+           max_evals=None, arm=None):
+    rows = load(path, arm=arm)
+    if not rows:
+        print(f"GATE: no graded rows in {path} (need iter.regret + iter.optimum)")
+        return 1
+    summary = {"source": str(path), "n": len(rows),
+               "arms": sorted({r["arm"] for r in rows})}
+    print(f"PLL REGRET -- {path}")
+    print(f"rows: {len(rows)}   arms: {', '.join(summary['arms'])}")
+
+    for a in summary["arms"]:
+        g = [r for r in rows if r["arm"] == a]
+        ns = int(sum(r["solved"] for r in g))
+        e2o = [r["evals_to_optimum"] for r in g if r["evals_to_optimum"]]
+        print(f"\n=== {a} (n={len(g)}) ===")
+        print(f"  solved {ns}/{len(g)} = {ns/len(g):.0%}   "
+              f"mean regret {st.mean(r['regret'] for r in g):.4f}   "
+              f"mean normalised regret "
+              f"{st.mean(r['norm_regret'] for r in g):.3f}")
+        if e2o:
+            print(f"  evaluations to the optimum, where reached: "
+                  f"mean {st.mean(e2o):.0f}  median {st.median(e2o):.0f}")
+        bc = budget_check(g, max_evals)
+        if bc:
+            cap = (f"; {bc['n_at_cap']}/{bc['n']} reached the {bc['cap']} cap"
+                   if bc.get("n_at_cap") is not None else "")
+            print(f"  evaluations used: mean {bc['mean_evals']:.0f} "
+                  f"(min {bc['min_evals_used']}, max {bc['max_evals_used']}){cap}")
+            if bc.get("n_at_cap") == 0:
+                print("  -> NOT budget-limited: no target reached the cap, so a "
+                      "solve rate below 100% here is a GENERATION or operator "
+                      "limit, and must not be reported as an operator ceiling "
+                      "until the generations are raised.")
+        nb = [r["target_id"] for r in g if r["action_space_binds"]]
+        if nb:
+            print(f"  action space binds on {len(nb)}/{len(g)}: "
+                  f"{', '.join(nb)} -- regret there is a bound, not a failure")
+
+        print(f"\n  by peptide length  (normRegret = fraction of the AVAILABLE "
+              f"gain not captured)")
+        print(f"  {'bin':>7s} {'n':>3s} {'solved':>9s} {'regret':>8s} "
+              f"{'normRegret':>11s} {'medNorm':>8s} {'availGain':>10s}")
+        for b in by_length(g):
+            print(f"  {b['bin']:>7s} {b['n']:3d} "
+                  f"{f'{b['n_solved']}/{b['n']}':>9s} {b['mean_regret']:8.4f} "
+                  f"{b['mean_norm_regret']:11.3f} {b['median_norm_regret']:8.3f} "
+                  f"{b['mean_gain']:10.4f}")
+
+        print(f"\n  correlations, each with a {n_perm}-permutation null "
+              f"(the size confound is listed, never omitted):")
+        print(f"  {'':42s} {'rho':>7s} {'perm p':>9s}")
+        cors = correlations(g, n_perm=n_perm)
+        for c in cors:
+            print(f"  {c['name']:42s} {c['rho']:+7.3f} {c['perm_p']:9.4f}")
+        if len(cors) >= 3:
+            raw, norm, conf = cors[0]["rho"], cors[1]["rho"], cors[2]["rho"]
+            if abs(norm) > abs(raw) and conf < -0.2:
+                print("  -> available gain SHRINKS with length, which SUPPRESSES "
+                      "the raw correlation; the normalised one is the real "
+                      "effect size, not the raw one.")
+
+        disc = discriminating(g, thresh)
+        print(f"\n  discriminating subset (regret > {thresh}): "
+              f"{len(disc)}/{len(g)} = {len(disc)/len(g):.0%} of targets")
+        if disc:
+            print("  " + ",".join(disc))
+        summary[a] = {
+            "n": len(g), "n_solved": ns, "solved_frac": ns / len(g),
+            "mean_regret": st.mean(r["regret"] for r in g),
+            "mean_norm_regret": st.mean(r["norm_regret"] for r in g),
+            "by_length": by_length(g), "correlations": cors,
+            "budget": bc, "action_space_binds": nb,
+            "discriminating": disc, "discriminating_thresh": thresh,
+            "worst": sorted(g, key=lambda r: -r["regret"])[:12],
+        }
+
+    if out_json:
+        Path(out_json).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_json).write_text(json.dumps(summary, indent=2))
+        print(f"\nwrote {out_json}")
+    return 0
+
+
+def compare(path_a, path_b, label_a="A", label_b="B", arm=None):
+    """PAIRED comparison of two runs over their SHARED targets.
+
+    Written for one question: is a solve rate below 100% a BUDGET limit, a
+    GENERATION limit, or the operator's ceiling? Those are not distinguishable
+    from one run, and calling an under-run an operator ceiling is the easiest
+    wrong conclusion available here. Pairing per target is what makes the
+    comparison readable at n=79 -- an unpaired mean difference would be swamped
+    by the between-target spread in available gain.
+
+    Reports a sign test over the targets whose regret MOVED, since the ties are
+    uninformative: a run where 74 of 79 targets are bit-identical and 5 improved
+    has not "improved by 0.012 nats on average", it has moved 5 targets.
+    """
+    A = {r["target_id"]: r for r in load(path_a, arm=arm)}
+    B = {r["target_id"]: r for r in load(path_b, arm=arm)}
+    shared = sorted(set(A) & set(B))
+    if not shared:
+        print(f"GATE: no shared targets between {path_a} and {path_b}")
+        return None
+    better = [k for k in shared if B[k]["regret"] < A[k]["regret"] - 1e-12]
+    worse = [k for k in shared if B[k]["regret"] > A[k]["regret"] + 1e-12]
+    moved = len(better) + len(worse)
+    # one-sided sign test on the targets that moved (ties carry no information)
+    p = float("nan")
+    if moved:
+        p = sum(math.comb(moved, k) for k in range(len(better), moved + 1)) \
+            / (2 ** moved)
+    out = {"n_shared": len(shared), "n_better": len(better),
+           "n_worse": len(worse), "n_unchanged": len(shared) - moved,
+           "sign_p": p, "better": better, "worse": worse}
+    print(f"\nPAIRED: {label_b} vs {label_a} over {len(shared)} shared target(s)")
+    for lab, d in ((label_a, A), (label_b, B)):
+        g = [d[k] for k in shared]
+        ns = int(sum(r["solved"] for r in g))
+        ev = [r["n_evals"] for r in g if r["n_evals"] is not None]
+        out[lab] = {"solved": ns, "solved_frac": ns / len(g),
+                    "mean_regret": st.mean(r["regret"] for r in g),
+                    "mean_norm_regret": st.mean(r["norm_regret"] for r in g),
+                    "mean_evals": st.mean(ev) if ev else None}
+        print(f"  {lab:24s} solved {ns}/{len(g)} = {ns/len(g):4.0%}   "
+              f"mean regret {out[lab]['mean_regret']:.4f}   "
+              f"mean normalised {out[lab]['mean_norm_regret']:.3f}   "
+              f"mean evals {out[lab]['mean_evals'] or 0:.0f}")
+    print(f"  moved: {len(better)} better, {len(worse)} worse, "
+          f"{out['n_unchanged']} bit-identical"
+          + (f"   sign test p({label_b} better than {label_a}) = {p:.4f}"
+             if moved else ""))
+    if moved and len(worse) > len(better):
+        # the one-sided test was asked in the losing direction; say so rather
+        # than leave a p near 1.0 to be read as "no difference"
+        rev = sum(math.comb(moved, k) for k in range(len(worse), moved + 1)) \
+            / (2 ** moved)
+        print(f"  (that p is one-sided in the stated direction and {label_b} is "
+              f"the WORSE run here; p({label_a} better than {label_b}) = "
+              f"{rev:.4f})")
+    if better:
+        print(f"  better on: {', '.join(better)}")
+    if out["n_unchanged"] / len(shared) > 0.8 and len(better) < 0.2 * len(shared):
+        print("  -> the second run is NOT finding materially more: most targets "
+              "are bit-identical. If its evaluation cap was also never reached, "
+              "this is the OPERATOR's ceiling, not a budget or generation limit.")
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--rows", required=True, help="seqmut_iter_pll_rows.jsonl")
+    ap.add_argument("--out-json", default="")
+    ap.add_argument("--arm", default="", help="restrict to one arm")
+    ap.add_argument("--thresh", type=float, default=DISCRIMINATING_REGRET)
+    ap.add_argument("--n-perm", type=int, default=20000)
+    ap.add_argument("--max-evals", type=int, default=0,
+                    help="the run's --max-evals, so the report can say whether "
+                         "the budget or the generations were the limit")
+    ap.add_argument("--compare", default="",
+                    help="a second rows file; adds a PAIRED comparison over the "
+                         "shared targets (use to separate an under-run from the "
+                         "operator's ceiling)")
+    ap.add_argument("--label", default="run A")
+    ap.add_argument("--compare-label", default="run B")
+    a = ap.parse_args()
+    rc = report(a.rows, out_json=(a.out_json or None), thresh=a.thresh,
+                n_perm=a.n_perm, max_evals=(a.max_evals or None),
+                arm=(a.arm or None))
+    if a.compare:
+        compare(a.rows, a.compare, label_a=a.label, label_b=a.compare_label,
+                arm=(a.arm or None))
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

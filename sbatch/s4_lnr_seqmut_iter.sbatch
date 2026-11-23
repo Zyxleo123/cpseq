@@ -18,11 +18,20 @@ banner
 # (agent/lnr/seqmut_iter.py): an LLM evolutionary loop (iter-llm / iter-llm-ala)
 # vs a matched random-EA control (iter-ea), both scored by the SAME cheap proxy
 # the single-shot seqmut arms use (mutate -> close window -> energy-weighted
-# retention x native_dG). The loop never regresses the frontier, so the ONLY
-# honest question is whether the LLM operator beats the random operator at a
-# MATCHED number of proxy evaluations (--max-evals). The best finalist per arm is
+# retention x native_dG). The proxy is deterministic, so the loop never regresses
+# the frontier and the ONLY honest question is whether the LLM operator beats
+# the random operator at a MATCHED number of proxy evaluations (--max-evals).
+# The best finalist per arm is
 # written as a standard seqmut row, so s4_lnr_boltz.sbatch (mut-held) folds it for
 # the true 4-fold dG with no change.
+#
+# RE-RUN NOTE (2026-11-18): the arms used to draw DIFFERENT random seed pools
+# (evolve() keyed its RNG on the arm name), so this job's FIRST run is confounded
+# as an operator comparison -- the arms started 7.66 REU apart on average, 19.7 on
+# 1jrr, against a headline arm difference of ~1 REU. The seed pool is now shared
+# across arms. Rows written before this date are not poolable with new ones.
+# The noise knobs (--z-commit / --no-reassess) are no-ops here: the proxy's SEM is
+# 0 by construction, so they matter only in the boltz-in-loop job.
 #
 # CPU only: scipy least_squares closure + PyRosetta mutant scan. Resumable: a
 # finished (target,arm) is skipped, and every proxy scan is cached in
