@@ -687,6 +687,16 @@ def llm_offspring(llm, t, window, k_mut, elite, m, gen, wt_ala, meta, rng,
             break
         if reply.status in (StepStatus.ERROR, StepStatus.BUDGET_CAP):
             status = reply.status.value.lower()
+            # Keep the FIRST failure's text. Without it a row records only
+            # `error: 80` with $0.00 cost, and the cause -- quota exhausted, a
+            # bad key, a rate limit, a timeout -- is indistinguishable from the
+            # outside; diagnosing job 119773 needed a fresh API probe hours
+            # later to learn it was "no credits remaining". One short string
+            # makes the row self-explanatory. First, not last, because later
+            # calls in an outage report the same thing and the first is the
+            # one with the original context.
+            if not meta.get("llm_error_detail"):
+                meta["llm_error_detail"] = (reply.detail or "")[:300]
             break
         if save_raw:
             meta.setdefault("llm_raw", []).append((reply.text or "")[:600])
@@ -1004,6 +1014,7 @@ def _finalist_row(t, arm, window, cache, pop, traj, meta, k_mut, relax_repeats,
         "mean_refine_rate": round(sum(d["refine_rate"] for d in gens) / len(gens), 3) if gens else 0.0,
         "llm_calls": meta["llm_calls"], "llm_cost_usd": meta["llm_cost_usd"],
         "status_counts": meta["status_counts"], "fallback_gens": meta.get("fallback_gens", 0),
+        "llm_error_detail": meta.get("llm_error_detail", ""),
     }
     if meta.get("model_id"):
         row["llm_cost_usd"] = meta["llm_cost_usd"]

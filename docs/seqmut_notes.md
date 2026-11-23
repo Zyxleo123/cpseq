@@ -1178,18 +1178,104 @@ jobs: 119392 (3-target validation, PASSED), 119413 (superseded, archived as
       80 gens -> the operator-ceiling result), 119665 (regret analysis)
 ```
 
+### RESULT: the LLM arm ran, and does NOT separate from random EA
+
+Job 119773 (29 discriminating targets, both arms, `n_gen=80`, $3.00 cap) plus
+job 120444 (the eval-matched EA control). **27 targets carry a funded LLM arm**;
+`6qg8` and `6seo` do not and are excluded everywhere below — see "the credits
+ran out" following.
+
+| | mean evals | mean regret | exact optimum |
+|---|---|---|---|
+| EA, generation-matched (`n_gen=80`) | 342.7 | 0.1435 | 0/27 |
+| EA, eval-matched (`n_gen=400`, cap 520) | 385.6 | 0.1415 | 1/27 |
+| **LLM** (`n_gen=80`) | **516.0** | **0.1361** | **5/27** |
+
+Paired, LLM vs the eval-matched EA: mean difference **−0.0054**, 15 better /
+10 worse / 2 tied, sign test **p = 0.21**. On the more sensitive
+"reached the exact optimum" endpoint the discordant pairs are 5 (LLM only) vs 1
+(EA only, `5onp`), exact McNemar **p = 0.11**.
+
+**Neither endpoint separates the operators at n=27.** Every comparison points
+the same way — the LLM has lower regret, finds 5 exact optima to the EA's 1, and
+explores more — but none of it reaches significance. The direction is consistent
+and the evidence is weak; both statements are needed.
+
+#### The arms CANNOT be budget-matched, and that is itself the finding
+
+The LLM arm used more evaluations on **27/27** targets (516 vs 343, **+51%**),
+so the generation-matched comparison flatters it. The control was meant to fix
+that by giving the EA an eval budget instead of a generation budget — and it
+could not: **5× the generations (80 → 400) moved the EA from 343 to 386 evals,
++13%**, never approaching the LLM's 516 (whose per-target *minimum*, 406, is
+above the EA's mean).
+
+The EA cannot spend the budget because `_point_mutate` keeps regenerating
+genomes already in the population; it saturates at ~386 distinct proposals. So
+"matched budget" is unreachable with this operator, and the operator ceiling
+measured earlier is really a **proposal-diversity** ceiling, not a budget or
+generation one. The LLM's one unambiguous advantage is that it proposes more
+distinct genomes — which is the thing the EA cannot be tuned into doing.
+
+#### Why n=27 is the ceiling on power here, and what would settle it
+
+Adding the other 50 targets will **not** help: the discriminating subset was
+chosen because the rest already sit at regret 0, where the LLM cannot do better
+than tie. The movers are capped at ~27, which is why p stalls near 0.1–0.2.
+
+What would separate them, in order of cost:
+
+1. **Replicate the LLM arm with several seeds per target.** The pll evaluator is
+   deterministic and the EA is seeded, so the LLM is the only stochastic
+   component; k seeds per target turn one noisy draw per target into a mean and
+   buy power without needing new targets. ~$1.66 per replicate.
+2. **Give the EA a diversity-aware operator** (reject known genomes before
+   scoring, scale `k_mut` with length). Free, and it is the honest control: the
+   present EA loses partly by failing to use its budget.
+3. **A harder target set** with more nonzero-regret targets.
+
+#### The credits ran out mid-run — and the failure mode is the dangerous one
+
+The last three targets processed (alphabetically) degraded: `6g86` took 12
+errors of 80, then `6qg8` and `6seo` errored on **all 80 calls at $0.00**. A
+direct probe returns `http_429: You have no credits remaining.` This is the
+OpenAI account's billing limit, **not** this project's `--max-spend-usd` ledger
+(which stopped at $1.66 of $3.00).
+
+It matters because `llm_offspring` falls back to a **random-EA child** on error.
+An unfunded LLM arm therefore writes rows, gets graded, and converges on its own
+EA control — which is indistinguishable from the real "separable, saturated"
+finding. `pll_llm_validity.py` exists for exactly this and flagged it
+(`VALID`/`PARTIAL`/`INVALID_TAIL`); it is wired into `s4_lnr_pll_regret.sbatch`
+as a gate, prints the API's own error text, and emits a ready-to-paste
+`--exclude` list. **Add credits before any further LLM arm.**
+
+Measured cost, for planning: **$0.0615/target** at `n_gen=80` (152 calls/target,
+~$0.0004/call) — so 29 targets is ~$1.78 and all 79 would be ~$4.86.
+
+#### Also settled: the scope question is NOT low-stakes
+
+See the scope section above for the matrix. `all` and `iface` are effectively
+one objective (3–6% divergence); **`window` is a different one (35–42%)**, and
+the three scopes agree on the optimum for only 22/85 targets. Everything here
+is graded under `all`, while `window` is what the LNR objective asks for, so
+**these results do not transfer to `window`.** Deciding that is a judgement
+about the objective; the measurement only proves the judgement matters.
+
 ### HANDOFF — state at 2026-11-23, picking this up in a new session
 
-**Status: the `pll` evaluator is finished and verified. Committed and pushed on
-branch `lnr/pll-inloop-evaluator`. The LLM arm is RUNNING as job 119773** (29
-targets, both arms, `n_gen=80`, $3.00 cap, 10 h, submitted 04:26).
-235 tests pass (`PYTHONPATH=agent:pilot/stage0 $PY -m pytest agent/lnr/ -q` —
-note `$PY` is `/zfsauton2/home/yixiz/Proteina-Complexa/.venv/bin/python`; the
-default `python` on `lov4` has no pytest).
+**Status: the `pll` evaluator is finished and verified, and the LLM arm HAS NOW
+RUN** (jobs 119773 + the eval-matched control 120444). Committed and pushed on
+branch `lnr/pll-inloop-evaluator`. 246 tests pass
+(`PYTHONPATH=agent:pilot/stage0 $PY -m pytest agent/lnr/ -q` — note `$PY` is
+`/zfsauton2/home/yixiz/Proteina-Complexa/.venv/bin/python`; the default `python`
+on `lov4` has no pytest).
 
-When 119773 lands, grade it with the command in "To run the LLM arm" below —
-the funding gate runs first and will refuse the comparison if the arm was not
-actually funded.
+**Read "RESULT: the LLM arm ran" immediately above this section first.** In
+short: the LLM arm does not separate from random EA (p = 0.21 on regret, 0.11 on
+exact optima, n = 27), it cannot be budget-matched because the EA's operator
+saturates, and **the OpenAI account has no credits left**, which cost the last
+two targets and blocks any rerun.
 
 #### What is done and believed
 

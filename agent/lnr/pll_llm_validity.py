@@ -80,6 +80,8 @@ def load(path, arm="iter-llm"):
             "fallback_frac": (fb_gens / n_gen) if n_gen else 0.0,
             "n_fatal": sum(sc.get(s, 0) for s in FATAL_STATUSES),
             "n_ok": sum(v for k, v in sc.items() if k.startswith("ok")),
+            "n_error": int(sc.get("error", 0)),
+            "error_detail": (it.get("llm_error_detail") or "")[:300],
         })
     return out
 
@@ -89,10 +91,18 @@ def verdict(rows, cap=None):
     n = len(rows)
     spend = round(sum(r["cost_usd"] for r in rows), 6)
     fatal = [r for r in rows if r["n_fatal"] > 0]
+    # Zero USABLE proposals, whether because no call was made or because every
+    # call failed. Both mean the row is a random-EA row under an LLM label, so
+    # the predicate is `n_ok == 0` rather than `llm_calls == 0`: in job 119773
+    # 6qg8 and 6seo each made 80 calls that ALL errored (quota exhausted, $0.00
+    # billed), and counting calls instead of successes filed them as merely
+    # "suspect" when they carried no LLM signal whatsoever.
+    never = [r for r in rows if r["n_ok"] == 0]
+    never_ids = {r["target_id"] for r in never}
     suspect = [r for r in rows
-               if r["fallback_frac"] > FALLBACK_FRAC_SUSPECT and not r["n_fatal"]]
+               if r["fallback_frac"] > FALLBACK_FRAC_SUSPECT
+               and not r["n_fatal"] and r["target_id"] not in never_ids]
     clean = [r for r in rows if r["fallback_gens"] == 0]
-    never = [r for r in rows if r["llm_calls"] == 0]
     out = {
         "n_targets": n,
         "total_spend_usd": spend,
@@ -104,6 +114,12 @@ def verdict(rows, cap=None):
         "fatal_targets": [r["target_id"] for r in fatal],
         "suspect_targets": [r["target_id"] for r in suspect],
         "never_called_targets": [r["target_id"] for r in never],
+        # Ready to paste into `pll_regret.py --exclude`: the targets that must
+        # come out of any LLM-vs-EA comparison built from this file.
+        "exclude_arg": ",".join(sorted(
+            {r["target_id"] for r in fatal} | never_ids)),
+        "error_details": sorted({r["error_detail"] for r in rows
+                                 if r["error_detail"]}),
         "mean_fallback_frac": (round(sum(r["fallback_frac"] for r in rows) / n, 4)
                                if n else 0.0),
         "mean_calls": (round(sum(r["llm_calls"] for r in rows) / n, 1) if n else 0.0),
@@ -165,6 +181,8 @@ def report(path, cap=None, out_json=None, arm="iter-llm", n_expected=0):
               f"{r['cost_usd']:>8.4f} {r['fallback_gens']:>7d} "
               f"{100*r['fallback_frac']:>5.1f}%  {sc}{flag}")
 
+    for d in v.get("error_details", []):
+        print(f"\n  ERROR REPORTED BY THE API: {d}")
     print(f"\n  clean (no fallback at all) : {v['n_clean']}/{v['n_targets']}")
     print(f"  mean fallback fraction     : {v['mean_fallback_frac']:.1%}")
     print(f"  mean LLM calls per target  : {v['mean_calls']}")
@@ -192,7 +210,11 @@ def report(path, cap=None, out_json=None, arm="iter-llm", n_expected=0):
         if v["fatal_targets"]:
             print(f"  budget-capped: {', '.join(v['fatal_targets'])}")
         if v["never_called_targets"]:
-            print(f"  never called : {', '.join(v['never_called_targets'])}")
+            print(f"  no usable LLM proposal at all: "
+                  f"{', '.join(v['never_called_targets'])}")
+        if v.get("exclude_arg"):
+            print(f"\n  To grade the FUNDED subset, drop these targets:\n"
+                  f"    --exclude {v['exclude_arg']}")
     elif v["verdict"] == "PARTIAL":
         print("  Some targets fell back for more than half their generations "
               "without hitting the cap (declines/malformed replies).\n"

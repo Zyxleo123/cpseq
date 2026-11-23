@@ -26,7 +26,12 @@ def _row(tid, *, arm="iter-llm", regret=0.1, n_gen=80, calls=80, cost=0.05,
     return {"target_id": tid, "mut_arm": arm,
             "iter": {"regret": regret, "n_gen_run": n_gen, "llm_calls": calls,
                      "llm_cost_usd": cost, "fallback_gens": fallback_gens,
-                     "status_counts": status_counts or {"ok": n_gen}}}
+                     # `is not None`, not `or`: an explicitly EMPTY dict means
+                     # "no statuses recorded" (a target that never called) and
+                     # must not be silently replaced by the all-ok default.
+                     "status_counts": (status_counts
+                                       if status_counts is not None
+                                       else {"ok": n_gen})}}
 
 
 def _write(tmp_path, rows):
@@ -68,12 +73,38 @@ def test_exhausted_cap_flips_verdict_even_if_no_row_says_budget_cap(tmp_path):
     assert V.verdict(V.load(p), cap=100.0)["verdict"] == "VALID"
 
 
-def test_never_called_is_invalid(tmp_path):
-    """Zero calls means the arm is the EA arm with a different name."""
-    p = _write(tmp_path / "d", [_row("t1"), _row("t2", calls=0, cost=0.0)])
+def test_no_usable_proposal_is_invalid_however_it_happened(tmp_path):
+    """Two shapes, one meaning: the arm is the EA arm with a different name.
+
+    `t2` made no calls at all. `t3` made all 80 and every one failed -- which is
+    what quota exhaustion looks like (job 119773: 6qg8/6seo, 80 errors, $0.00
+    billed). Keying on call COUNT would file t3 as merely suspect although it
+    carries no LLM signal whatsoever, so the predicate is usable SUCCESSES.
+    """
+    rows = [_row("t1"),
+            _row("t2", calls=0, cost=0.0, status_counts={}, fallback_gens=80),
+            _row("t3", calls=80, cost=0.0, status_counts={"error": 80},
+                 fallback_gens=80)]
+    p = _write(tmp_path / "d", rows)
     v = V.verdict(V.load(p), cap=10.0)
     assert v["verdict"] == "INVALID_TAIL"
-    assert v["never_called_targets"] == ["t2"]
+    assert v["never_called_targets"] == ["t2", "t3"]
+    # neither is double-counted as "suspect", and both are named for exclusion
+    assert v["suspect_targets"] == []
+    assert v["exclude_arg"] == "t2,t3"
+
+
+def test_api_error_text_is_surfaced(tmp_path, capsys):
+    """The row keeps the first failure's text so the cause is readable without
+    a fresh API probe -- diagnosing 119773 needed one to learn 'no credits'."""
+    rows = [_row("t1", calls=80, cost=0.0, status_counts={"error": 80},
+                 fallback_gens=80)]
+    rows[0]["iter"]["llm_error_detail"] = "http_429: You have no credits remaining."
+    p = _write(tmp_path / "dd", rows)
+    V.report(p, cap=3.0)
+    out = capsys.readouterr().out
+    assert "no credits remaining" in out
+    assert "--exclude t1" in out
 
 
 def test_mostly_malformed_is_partial_not_invalid(tmp_path):
