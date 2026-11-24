@@ -1765,21 +1765,96 @@ complete measured list is aimed at, and `iter.n_dup_proposed / (llm_calls *
 m_off)` is the identical statistic to compute on the new rows — so the
 before/after is a like-for-like comparison, not a re-derivation.
 
+### A TRAP I walked into: the duplicate rate is NOT comparable across arms
+
+`pll_regret.novelty` reads `n_proposed` and `n_new` per generation out of the
+trajectory, which looks like the fair cross-arm waste metric and is not. The
+arms are not measured at the same point:
+
+* **`llm_offspring` drops repeated proposals BEFORE it returns**, so an LLM
+  arm's returned children are novel *by construction*. Measured: **0.7% dup
+  before the complete-history fix, 0.6% after** — the column cannot see the fix
+  at all. An LLM arm pays for its duplicates in **re-asks** (extra calls, extra
+  dollars, generations that return fewer than `m_off` children), and that cost
+  lives in `iter.n_dup_proposed` and `iter.llm_calls`.
+* **`ea_offspring` gives up after 8 colliding tries and returns the duplicate
+  anyway**, so the EA's waste does land in that column.
+
+I reported "LLM 0.5% vs EA 72.7%" as evidence the fix worked before checking the
+baseline. It is not evidence of anything about the operator. The printed table
+now states the asymmetry inline, because the invalid reading is the natural one.
+
+**The quantity that IS comparable is `novel_per_gen`** — novel children actually
+delivered per generation, measured identically for every arm, and the thing that
+decides how much of an evaluation budget an operator can spend:
+
+```
+                                      novel/gen (of m_off=12 requested)
+  iter-llm  BEFORE (job 119773, n=29)        5.8
+  iter-llm  AFTER  (partial, n=2)           11.1
+  iter-ea   both runs                    4.1-4.5
+```
+
+So the fixed arm converts nearly every requested proposal into a new genome
+where it previously converted under half — consistent with `n_dup_proposed` on
+`1ee5` (68.5% → 9.0% of slots) and with distinct evals (407 → 900). The
+conclusion survived; the first evidence offered for it did not.
+
+### `iter-ea-div`: the free control, and why the EA saturates
+
+The EA's ceiling is **not** deduplication — `ea_offspring` already resamples
+against `known`. The cause is narrower: **parents are drawn only from the ≤12
+member elite**, so offspring never leave a small neighbourhood; once it is
+exhausted all 8 tries collide and the function returns a known duplicate, which
+spends the proposal slot on a genome that cannot enter the population. Measured
+at **4.1 novel children per generation out of 12 requested, 65.5% duplicates**
+across 29 targets.
+
+`ea_offspring_diverse` (arm `iter-ea-div`) adds **immigration**: on saturation,
+draw from the whole action space rather than surrender the slot, and always
+mutate (a pure crossover of two elites is the likeliest way to regenerate a
+known genome). On a deterministically saturated neighbourhood — all of positions
+0 and 1 known at `k_mut=1`, positions 2 and 3 open — plain returns **0/6** novel
+and diverse returns **6/6** with `n_immigrants=6`, recorded per row.
+
+Two deliberate non-choices:
+
+* **`k_mut` is NOT scaled with length**, although earlier notes floated it.
+  `k_mut` is the Hamming budget the KNOWN OPTIMUM is computed under
+  (`TargetPSSM.best_subs(..., k_mut)`), so an arm that widens its own `k_mut`
+  moves its own regret target and stops being comparable to the other arms.
+  Length scaling is a run-level decision, not an operator's.
+* **`iter-ea` is untouched.** The diverse operator is a third arm, not a
+  revision, so every regret number already recorded against the random-EA
+  baseline stays valid (pinned by
+  `test_iter_ea_is_not_changed_by_the_diverse_arm_existing`).
+
+It is CPU-only and free. It is queued to run *after* the paid job rather than
+concurrently, because both would append to the same `pll` score cache — and it
+was deliberately NOT added to the paid run mid-flight, since introducing
+untested-in-production code into a run that costs money changes two things at
+once.
+
 ### Files
 
 ```
   agent/lnr/env.py            _rec_residue_labels, receptor_contacts_by_position
   agent/lnr/seqmut.py         receptor_context, _residue_table(rec_ctx=)
   agent/lnr/seqmut_iter.py    Population.measured_keys, tried() reordered,
-                              _measured_block, _coverage_block,
+                              _measured_block, _coverage_block, MEASURED_CAP,
                               iter_brief(measured=/mutable=/rec_ctx=),
                               HI_EFFORT_ARM, make_llm_clients,
-                              _probe_call_cost, iter.effort/effort_sent
+                              _probe_call_cost, iter.effort/effort_sent,
+                              ea_offspring_diverse + ITER_EA_DIV_ARM,
+                              iter.n_immigrants
+  agent/lnr/pll_regret.py     novelty/print_novelty (--traj), and compare()
+                              now reports dup_frac, cost and n_at_eval_cap
+  agent/lnr/pll_llm_validity  iter.effort/effort_sent -> INVALID_EFFORT
   sbatch/s4_lnr_seqmut_iter_pll.sbatch   HI_EFFORT/HI_N_GEN/PROBE + warnings
   sbatch/submit_lnr_seqmut_iter_pll.sh   the three new vars in the env file
 ```
 
-257 tests pass. The receptor context is verified aligned on **87/87 targets**
+260 tests pass. The receptor context is verified aligned on **87/87 targets**
 (`receptor_contacts_by_position` returns None rather than a partial answer if
 the labels cannot be aligned to `rec_ca`, so a mislabelled partner cannot reach
 a brief).
