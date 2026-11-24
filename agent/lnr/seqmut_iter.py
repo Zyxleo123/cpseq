@@ -76,7 +76,10 @@ EPS = 1e-6
 
 ITER_LLM_ARMS = ("iter-llm", "iter-llm-ala", "iter-llm-hi")
 ITER_EA_ARM = "iter-ea"
-ITER_ARMS = ITER_LLM_ARMS + (ITER_EA_ARM,)
+# The diversity-aware control. A SEPARATE arm, never a change to `iter-ea`, so
+# every number already recorded against the random-EA baseline stays valid.
+ITER_EA_DIV_ARM = "iter-ea-div"
+ITER_ARMS = ITER_LLM_ARMS + (ITER_EA_ARM, ITER_EA_DIV_ARM)
 
 # `iter-llm-hi` is the SAME operator and prompt at a higher reasoning effort and
 # correspondingly fewer generations, so the two LLM arms cost about the same in
@@ -444,6 +447,81 @@ def _point_mutate(d: dict, t, k_mut: int, iface, rng, p=0.7) -> dict:
         d[i] = rng.choice([a for a in AA20 if a not in (wt, d[i])] or
                           [a for a in AA20 if a != d[i]])
     return d
+
+
+def _random_genome(t, k_mut: int, iface, rng):
+    """A fresh genome drawn from the WHOLE action space, not a parent's
+    neighbourhood -- the immigration step. Mirrors `_seed_population`'s draw so
+    the diverse arm's novelty comes from the same distribution the seed pool did.
+    """
+    kk = rng.randint(1, max(1, k_mut))
+    pos = rng.sample(iface, min(kk, len(iface)))
+    g = []
+    for i in pos:
+        wt = t.seq[i] if i < len(t.seq) else "A"
+        g.append((i, rng.choice([a for a in AA20 if a != wt])))
+    return _norm(g)
+
+
+def ea_offspring_diverse(elite, t, k_mut: int, iface, rng, m: int, known=(),
+                         tries: int = 8, immigrate: int = 24) -> list:
+    """The DIVERSITY-AWARE control operator (`iter-ea-div`).
+
+    Why a second operator rather than a fix to the first: the random-EA arm's
+    measured ceiling is a PROPOSAL-DIVERSITY ceiling, not a budget or generation
+    one -- 3.2x the generations moved 5 of 79 targets and left 74 bit-identical,
+    and at n_gen=80 only 360 of ~980 proposals were novel. `ea_offspring`
+    already resamples against `known`, so the cause is narrower than
+    deduplication: **parents are drawn only from the <=12-member elite**, so
+    offspring never leave a small neighbourhood, and once it is exhausted all
+    `tries` collide and the function returns a known duplicate anyway. The
+    proposal slot is then spent on a genome that cannot enter the population.
+
+    The fix is IMMIGRATION: when the parents' neighbourhood is saturated, draw a
+    fresh genome from the whole action space instead of surrendering the slot.
+    That is what lets the EA actually spend an evaluation budget, which is what
+    makes an LLM-vs-EA comparison about the operator instead of about who got
+    more oracle calls.
+
+    What this deliberately does NOT do is scale `k_mut` with length, although
+    the notes floated it: `k_mut` is the Hamming budget the KNOWN OPTIMUM is
+    computed under (`TargetPSSM.best_subs(..., k_mut)`), so changing it inside
+    an arm would change that arm's regret target and make the arms incomparable.
+    Length scaling is a run-level decision, not an operator's.
+
+    `iter-ea` is left exactly as it was, so every number already recorded
+    against it stays valid and this arm is a third column, not a revision.
+    """
+    out, known = [], set(known)
+    n_immigrants = 0
+    for _ in range(m):
+        p = _sample_parents(elite, rng, k=2)
+        if not p:
+            break
+        parent_rec = min(pp["recovered"] for pp in p)
+        child, cand = None, None
+        for _try in range(tries):
+            d = _crossover(p[0]["subs"], p[1]["subs"], k_mut, rng)
+            # p=1.0: always mutate. A pure crossover of two elites is the single
+            # likeliest way to regenerate a genome already in the population.
+            cand = _norm(_point_mutate(d, t, k_mut, iface, rng, p=1.0).items())
+            if S.subs_key(cand) not in known:
+                child = cand
+                break
+            p = _sample_parents(elite, rng, k=2) or p
+        if child is None:
+            # Neighbourhood saturated: immigrate rather than spend the slot on a
+            # genome that is already measured and cannot enter the population.
+            for _try in range(immigrate):
+                g = _random_genome(t, k_mut, iface, rng)
+                if S.subs_key(g) not in known:
+                    child, n_immigrants = g, n_immigrants + 1
+                    break
+            if child is None:
+                child = cand        # the action space itself is exhausted
+        known.add(S.subs_key(child))
+        out.append((child, parent_rec))
+    return out, n_immigrants
 
 
 def ea_offspring(elite, t, k_mut: int, iface, rng, m: int, known=()) -> list:
@@ -1025,6 +1103,10 @@ def evolve(arm, t, window, cache, *, k_mut, n_seed, n_gen, m_off, max_evals,
                                      noise_sd=noise_sd,
                                      wt_score=(wt_m or {}).get("recovered"),
                                      objective=objective, rec_ctx=rec_ctx)
+        elif arm == ITER_EA_DIV_ARM:
+            children, n_imm = ea_offspring_diverse(
+                elite, t, k_mut, iface, rng, m_off, known=set(pop.members))
+            meta["n_immigrants"] = meta.get("n_immigrants", 0) + n_imm
         else:
             children = ea_offspring(elite, t, k_mut, iface, rng, m_off,
                                     known=set(pop.members))
@@ -1311,6 +1393,11 @@ def _finalist_row(t, arm, window, cache, pop, traj, meta, k_mut, relax_repeats,
         "llm_calls": meta["llm_calls"], "llm_cost_usd": meta["llm_cost_usd"],
         "status_counts": meta["status_counts"], "fallback_gens": meta.get("fallback_gens", 0),
         "llm_error_detail": meta.get("llm_error_detail", ""),
+        # How often the diverse EA had to leave the parents' neighbourhood. If
+        # this is ~0 the arm is behaving as plain `iter-ea`; if it is large, the
+        # elite neighbourhood was saturated and the extra evaluations are coming
+        # from immigration, which is the mechanism being tested.
+        "n_immigrants": meta.get("n_immigrants", 0),
         "effort": meta.get("effort"),
         # Whether `reasoning_effort` was actually ACCEPTED by the API. The
         # OpenAI client drops the parameter and silently retries without it on a

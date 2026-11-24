@@ -11,6 +11,7 @@ Run: python -m pytest agent/lnr/test_seqmut_iter.py -q
 
 from __future__ import annotations
 
+import random
 import json
 import sys
 import types
@@ -787,3 +788,61 @@ def test_measured_block_is_complete_at_the_jobs_real_eval_budget():
     # claiming completeness it cannot deliver
     small = I._measured_block([f"{i}:W" for i in range(50)], cap=10)
     assert "truncated" in small
+
+
+def test_diverse_ea_immigrates_instead_of_surrendering_the_slot():
+    """`iter-ea` returns a KNOWN duplicate when the elite neighbourhood is
+    saturated, which spends a proposal slot on a genome that cannot enter the
+    population. That is the measured proposal-diversity ceiling. The diverse
+    operator must instead leave the neighbourhood."""
+    t = _T("x1", "ACDE", [1] * 4)
+    iface = [0, 1, 2, 3]
+    elite = [{"subs": ((0, "W"),), "recovered": -5.0, "sem": 0.0,
+              "obs": [-5.0], "gen": 1},
+             {"subs": ((1, "W"),), "recovered": -4.0, "sem": 0.0,
+              "obs": [-4.0], "gen": 1}]
+    # At k_mut=1 the set reachable from those two parents is exactly:
+    # the empty genome (drop), and every single substitution at position 0 or 1
+    # (crossover then replace). Declaring all of that known SATURATES the
+    # neighbourhood exactly, with positions 2 and 3 left completely open -- so
+    # the plain operator provably cannot produce a novel child and the diverse
+    # one can only do it by leaving the neighbourhood.
+    known = {I.S.subs_key([])}
+    for i in (0, 1):
+        for a in I.AA20:
+            known.add(I.S.subs_key([(i, a)]))
+    plain = I.ea_offspring(elite, t, 1, iface, random.Random(0), 6, known=known)
+    div, n_imm = I.ea_offspring_diverse(elite, t, 1, iface, random.Random(0), 6,
+                                        known=known)
+    novel_plain = sum(1 for g, _ in plain if I.S.subs_key(g) not in known)
+    novel_div = sum(1 for g, _ in div if I.S.subs_key(g) not in known)
+    assert len(div) == 6
+    # the diverse arm must find novel genomes where the plain one cannot
+    assert novel_div == 6, f"diverse arm returned {novel_div}/6 novel"
+    assert novel_div > novel_plain
+    assert n_imm > 0                      # and it reports how it got them
+
+
+def test_diverse_ea_keeps_k_mut_so_the_regret_target_is_unchanged():
+    """Scaling k_mut inside an arm would move the KNOWN OPTIMUM that arm is
+    graded against (`best_subs` is computed under k_mut), making the arms
+    incomparable. The operator must never widen its own Hamming budget."""
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    elite = [{"subs": (), "recovered": -1.0, "sem": 0.0, "obs": [-1.0], "gen": 0}]
+    for k in (1, 2, 3):
+        div, _ = I.ea_offspring_diverse(elite, t, k, list(range(10)),
+                                        random.Random(1), 25, known=set())
+        assert all(len(g) <= k for g, _ in div), f"k_mut={k} exceeded"
+
+
+def test_iter_ea_is_not_changed_by_the_diverse_arm_existing():
+    """Every regret number already recorded against iter-ea must stay valid, so
+    the plain operator has to be bit-identical given the same seed."""
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    elite = [{"subs": ((0, "W"),), "recovered": -5.0, "sem": 0.0,
+              "obs": [-5.0], "gen": 1},
+             {"subs": ((3, "F"),), "recovered": -4.0, "sem": 0.0,
+              "obs": [-4.0], "gen": 1}]
+    a = I.ea_offspring(elite, t, 2, list(range(10)), random.Random(7), 8)
+    b = I.ea_offspring(elite, t, 2, list(range(10)), random.Random(7), 8)
+    assert [I.S.subs_key(g) for g, _ in a] == [I.S.subs_key(g) for g, _ in b]
