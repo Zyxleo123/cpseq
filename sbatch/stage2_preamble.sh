@@ -155,6 +155,21 @@ export BINDSCORE_ORDER_SEED="${BINDSCORE_ORDER_SEED:-0}"
 export LIGANDMPNN_HOME="${LIGANDMPNN_HOME:-/zfsauton2/home/yixiz/Proteina-Complexa/community_models/LigandMPNN}"
 
 # ---------------------------------------------------------------------------
+# Publication figure for that gate (s4_lnr_fig_pll_cpset.sbatch)
+# ---------------------------------------------------------------------------
+# Draws ONLY from the committed rows above -- no score is recomputed, so the
+# figure is re-renderable in ~20 s on a CPU node after any styling change, and
+# every statistic in it is computed by lnr.metric_gate rather than typed in.
+# `_v2` is the 3-model run (119321); the primary model is the headline.
+export FIG_PLL_ROWS="${FIG_PLL_ROWS:-${RUN}/lnr/bindscore_v2.jsonl}"
+export FIG_PLL_DECOY="${FIG_PLL_DECOY:-${RUN}/lnr/bindscore_v2_decoy.jsonl}"
+export FIG_PLL_OUTDIR="${FIG_PLL_OUTDIR:-${RUN}/lnr/figs}"
+export FIG_PLL_STEM="${FIG_PLL_STEM:-fig_pll_cpset}"
+export FIG_PLL_MODEL="${FIG_PLL_MODEL:-ligandmpnn_v_32_020_25}"
+export FIG_PLL_NPERM="${FIG_PLL_NPERM:-20000}"
+export FIG_PLL_FORMATS="${FIG_PLL_FORMATS:-pdf,png}"
+
+# ---------------------------------------------------------------------------
 # Pose-conditioned-likelihood IN-LOOP fitness (s4_lnr_seqmut_iter_pll.sbatch)
 # ---------------------------------------------------------------------------
 # The same metric as BINDSCORE_* above, deployed as the search's fitness instead
