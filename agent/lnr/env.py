@@ -163,6 +163,54 @@ def _rec_ca(path: str, chain: str) -> np.ndarray:
     return np.asarray(out, float)
 
 
+def _rec_residue_labels(path: str, chain: str) -> list[str]:
+    """One label ("K142") per receptor CA, in EXACTLY the order `_rec_ca` yields.
+
+    The receptor half of every pair in `LNRTarget.contacts` is a position into
+    `rec_ca`, so any labelling of those partners has to reproduce `_rec_ca`'s
+    filter and order atom for atom: same ATOM/HETATM acceptance, same altloc
+    rule, CA-only, and -- the part that matters -- NO backbone-completeness
+    drop. Labelling via `_read_chain` instead looks equivalent and is not: it
+    discards residues missing an N or a C, which shifts every index after the
+    first such gap and silently mislabels the contact partners. The two loops
+    are kept adjacent so a future edit to one is visibly an edit to both, and
+    `receptor_contacts_by_position` refuses to label at all if the lengths
+    disagree.
+    """
+    out = []
+    for line in open(path):
+        if not line.startswith(("ATOM", "HETATM")) or line[21] != chain:
+            continue
+        if line[16] not in (" ", "A") or line[12:16].strip() != "CA":
+            continue
+        one = _THREE_TO_ONE.get(line[17:20].strip(), "X")
+        out.append(f"{one}{line[22:26].strip()}{line[26].strip()}")
+    return out
+
+
+def receptor_contacts_by_position(t: LNRTarget, max_per_pos: int = 6):
+    """Per peptide index, the receptor residues it touches, NEAREST FIRST.
+
+    This is input data read off the same deposited complex the rest of the
+    pipeline uses -- not any scorer's output -- so it can be shown to a proposal
+    operator without the operator's score becoming self-referential.
+
+    Returns None (not a partial answer) when the labels cannot be aligned to
+    `rec_ca`; a mislabelled partner is worse than an absent one, because it
+    reads as real chemistry.
+    """
+    labels = _rec_residue_labels(t.pdb_path, t.rec_chain)
+    if len(labels) != len(t.rec_ca):
+        return None
+    by_pos: dict[int, list] = {}
+    for p, r in t.contacts:
+        if 0 <= p < t.length and 0 <= r < len(labels):
+            d = float(np.linalg.norm(t.CA[p] - t.rec_ca[r]))
+            by_pos.setdefault(p, []).append((d, labels[r]))
+    return [[lab for _, lab in sorted(by_pos.get(i, []))[:max_per_pos]]
+            for i in range(t.length)]
+
+
 def load_target(target_id: str, pdb_path: str, c1: str, c2: str) -> LNRTarget | None:
     """Load a target. The peptide is the shorter chain (5-19 vs 100-400 here)."""
     Na, CAa, Ca, seqa = _read_chain(pdb_path, c1)

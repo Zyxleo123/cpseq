@@ -582,24 +582,51 @@ def parse_subs(text: str, L: int, k_mut: int):
     return subs, "ok"
 
 
-def _residue_table(t, wt_ala=None) -> str:
+def receptor_context(t, max_per_pos: int = 6):
+    """Per-position receptor contact partners, or None if unavailable.
+
+    Never raises: a brief that loses one column is a worse brief, but a brief
+    that cannot be built at all is a dead generation.
+    """
+    try:
+        from lnr import env as _env
+        return _env.receptor_contacts_by_position(t, max_per_pos=max_per_pos)
+    except Exception:    # noqa: BLE001  a diagnostic must never fail a run
+        return None
+
+
+def _residue_table(t, wt_ala=None, rec_ctx=None) -> str:
     """idx / aa / contacts, and (for the -ala evidence arm) the per-residue WT
     interface energy from the alanine scan -- the binding diagnostics the LLM
-    allocates its edits against."""
+    allocates its edits against.
+
+    `rec_ctx` adds WHAT EACH POSITION FACES (nearest receptor residues first).
+    Without it the brief asks the model to match "the shape and chemistry of the
+    receptor atoms across from it" while telling it only how MANY atoms those
+    are -- a contact count of 15 does not distinguish an aromatic pocket from a
+    salt bridge, so the structural reasoning the arm is supposed to contribute
+    has nothing to run on. The partners are read off the deposited complex, not
+    out of the scorer, so this does not make the fitness self-referential.
+    """
+    head, dash = "  idx  aa  contacts", "  ---  --  --------"
     if wt_ala:
-        rows = ["  idx  aa  contacts  bindE(ddG_ala)",
-                "  ---  --  --------  --------------"]
-    else:
-        rows = ["  idx  aa  contacts", "  ---  --  --------"]
+        head += "  bindE(ddG_ala)"; dash += "  --------------"
+    if rec_ctx:
+        head += "  faces (receptor, nearest first)"
+        dash += "  -------------------------------"
+    rows = [head, dash]
     for i in range(t.length):
         aa = t.seq[i] if i < len(t.seq) else "X"
         c = t.per_res_contacts[i] if i < len(t.per_res_contacts) else 0
+        r = f"  {i:3d}  {aa}   {c:3d}"
         if wt_ala:
             e = wt_ala.get(i, wt_ala.get(str(i)))
             es = f"{e:+.2f}" if isinstance(e, (int, float)) else "   .  "
-            rows.append(f"  {i:3d}  {aa}   {c:3d}       {es:>8s}")
-        else:
-            rows.append(f"  {i:3d}  {aa}   {c:3d}")
+            r += f"       {es:>8s}"
+        if rec_ctx:
+            partners = rec_ctx[i] if i < len(rec_ctx) else []
+            r += "  " + (" ".join(partners) if partners else "(no contacts)")
+        rows.append(r)
     return "\n".join(rows)
 
 

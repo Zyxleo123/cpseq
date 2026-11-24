@@ -1500,3 +1500,209 @@ edit  agent/lnr/bindscore.py         TargetPSSM: metric-aware (DEFAULT pll_bg),
    targets like `1t5z` are scored against an optimum `_point_mutate` cannot
    reach. Ranks in `pll_regret` are **tie-corrected** — 36/79 regrets are exactly
    0.0 and ordinal ranks biased ρ by ~0.03.
+
+---
+
+## Strengthening the LLM arm: what it was never shown (2026-11-23)
+
+The previous section's conclusion — the LLM operator does not separate from
+random EA (p = 0.21 on regret, 0.11 on exact optima) — was read as a result
+about the operator. Reading `llm_offspring` and `iter_brief` instead shows that
+**part of it is a result about the brief.** Three defects, all in what the model
+was allowed to see, all fixed here. None of them changes the fitness, the seed
+pool, the budget accounting or the EA control, so the comparison stays paired
+and the earlier numbers stay the baseline it is measured against.
+
+### Defect 1 — the duplicate-avoidance instruction was unsatisfiable
+
+The brief said: *"Every set must be one NOT listed anywhere above."* What was
+listed above: `elite(max_n=12)` and `tried(limit=14)`. **At most 26 genomes out
+of a pool reaching ~516.** The model was told to avoid repeating a history it
+was shown 5% of.
+
+So the measured **34–45% duplicate proposal rate is a prompt bug, not a model
+failure**, and it is expensive: a repeat is dropped without being scored, so it
+costs the generation a proposal slot. The full key set was *already a parameter
+of `llm_offspring`* (`known=set(pop.members)`) — used to filter proposals after
+the fact, never shown to the model that was being asked to satisfy it.
+
+Now `Population.measured_keys()` returns every member, best-first, and
+`_measured_block` prints all of them. ~420 keys costs ~1.4 kB. The instruction
+is now checkable, and says so.
+
+> `measured_keys` returns **raw** keys. The wild-type's key is `""`;
+> prettifying it to `"(none)"` in the accessor would make `"" in set(keys)`
+> false and quietly exempt the wild-type from the repeat filter. Rendering is
+> the display layer's job —
+> `test_measured_keys_are_raw_so_the_wild_type_is_not_exempt_from_the_filter`.
+
+### Defect 2 — `tried` spent its 14 rows on the least informative genomes
+
+It was sorted **worst-first**. The sets that score worst say nothing about where
+the next gain is; the near-misses just behind the frontier are the ones whose
+near-success localises it. Now 2/3 near-misses and 1/3 worst, so the dynamic
+range stays visible while the informative end gets the rows.
+
+### Defect 3 — the model was asked to reason about chemistry it could not see
+
+`propose_mode` for the pll objective tells the model the score rewards
+*"matching the shape and chemistry of the receptor atoms across from it."* The
+per-residue table gave it `idx / aa / contacts`. **A contact count of 15 does
+not distinguish an aromatic pocket from a salt bridge.** The arm was being
+graded on structural reasoning with the structure withheld — against an EA
+control that reads no brief and so loses nothing by it.
+
+`env.receptor_contacts_by_position` adds a `faces` column: the receptor residues
+each position touches, nearest first. On `3ayu` (the worst-regret target, 0.483
+of 0.947 available):
+
+```
+  idx  aa  contacts  faces (receptor, nearest first)
+    5  D    16       H84 A83 A85 L81 A121 L82
+    7  L    15       F86 A85 A87 H84 H124 G93
+```
+
+This is **input data read off the same deposited complex**, not scorer output,
+so it does not make the fitness self-referential. Aligned on 87/87 targets.
+
+> **The index-alignment trap.** The receptor half of each pair in
+> `LNRTarget.contacts` is a position into `rec_ca`, which `_rec_ca` builds from
+> *every* CA in the chain. Labelling via `_read_chain` looks equivalent and is
+> not — it drops residues missing an N or C, shifting every index after the
+> first gap and mislabelling partners with plausible-looking chemistry.
+> `_rec_residue_labels` mirrors `_rec_ca` line for line and
+> `receptor_contacts_by_position` returns **None rather than a partial answer**
+> when the lengths disagree.
+
+### What was deliberately NOT added: the credit table (the back pocket)
+
+`pll_bg` is a **mean of independent per-position terms**. Every measured genome
+therefore determines the exact marginal contribution of each substitution in it:
+if `{5:W}` scores `x` and the wild-type `w`, then `5:W` contributes `(x−w)·L`,
+always, with no confounding. **The arm's own measurement history is a complete
+per-position credit table, derivable by arithmetic from numbers it already paid
+for.** Showing it as `pos:AA → +Δ nats` would almost certainly collapse regret.
+
+**It is not pulled, on purpose.** On a separable objective, a credit table turns
+the operator into coordinate descent: take the top-k per-position gains, which
+is `TargetPSSM.best_subs` — the closed-form optimum. "LLM beats EA" would then
+mean *"we wrote the algorithm into the prompt"*, and the LLM would be a natural
+language wrapper around a greedy decode.
+
+**If it is ever pulled, it needs a matched non-LLM control in the same run:** a
+greedy/coordinate-descent EA that does the identical arithmetic. That control is
+CPU-only and free, so there is no excuse for running one without the other. Read
+the outcomes as:
+
+| outcome | what it means |
+|---|---|
+| both reach regret 0 | a finding about the **objective** (separable), not the operator |
+| LLM beats greedy | a real edge: the LLM is using something beyond the per-position sum |
+| greedy beats LLM | the prompt is a lossy channel for an algorithm better written in code |
+
+The line the current blocks hold to: **coverage, never credit.** `_coverage_block`
+reports which amino acids remain untried per position, which positions were
+never edited, and which are exhausted as single edits — all of it bookkeeping
+about *where the search has been*, with no fitness value anywhere in it
+(`test_coverage_block_reports_untouched_positions_and_no_scores` asserts no
+score leaks in).
+
+### The `iter-llm-hi` arm: separating "thinks harder" from "proposes more"
+
+The one unambiguous advantage measured for the LLM arm is that it proposes more
+**distinct** genomes (516 evals vs 343, on 27/27 targets). That is a diversity
+effect. A better-reasoning model need not improve it at all, so "the LLM helps"
+and "more proposals help" are still confounded.
+
+`iter-llm-hi` is the same operator and the same prompt at a higher reasoning
+effort with **fewer generations, so the dollars match and the generations do
+not** — the opposite trade from the existing arms, which is what makes the two
+readings separable.
+
+Three places this can lie, each closed:
+
+1. **The cap is per client.** A second effort level means a second client and a
+   second `SpendLedger`, so passing both `--max-spend-usd` would silently double
+   the run's real ceiling — and an exceeded cap does not stop the run,
+   `llm_offspring` substitutes a random-EA child. `make_llm_clients` **splits**
+   the cap across effort ledgers (not across arms: arms at the same effort share
+   one client) and prints every share.
+2. **`reasoning_effort` can be silently dropped.** `openai_api.py` disables the
+   parameter and retries without it on a 400. A hi arm would then run at the
+   model's default effort while every other column looked normal — producing
+   "effort does not matter" from an arm that never had it. Rows now carry
+   `iter.effort` and `iter.effort_sent`; **gate on `effort_sent`, not on the
+   arm's name.**
+3. **Equal generations is not equal spend.** `--hi-n-gen` cannot be guessed, so
+   `--probe-call-cost` makes one realistically-sized call per effort level and
+   prints the measured $/call plus the `n_gen` each ledger affords. Costs ~a
+   tenth of a cent; leaving `HI_N_GEN=0` runs the hi arm at the low arm's
+   `n_gen` and the job prints a WARNING saying the arms are generation-matched.
+
+### What to run, in order
+
+**Nothing here has been submitted — these changes are unmeasured.** The brief
+changes are free to validate and the hi arm must be priced before it is run.
+
+```bash
+cd /zfsauton2/home/yixiz/lp2cp-agent      # from lov4; sbatch works directly
+D=/zfsauton/scratch/yixiz/lp2cp_stage2/lnr
+T=3r42,2b1n,3n5u,5y59,4x3h,6fq4,6g86,5a29,1t3l,2hwl,6qg8,4k0u,1t5z,3brh,4z2o,3vxw,3r7g,4w50,2qos,2wv5,4rs9,6seo,2f31,1ee5,4piq,5frs,4mn8,5onp,5wir
+```
+
+**Step 1 — price it (~$0.001, one call per effort level).** Do this before
+anything else: it is the only honest source for `--hi-n-gen`.
+
+```bash
+SEQITER_PLL_ARMS=iter-llm,iter-llm-hi SEQITER_PLL_TARGETS=$T \
+SEQITER_PLL_PROBE=1 SEQITER_PLL_N_GEN=80 SEQITER_PLL_M_OFF=12 \
+SEQITER_PLL_MAX_SPEND=3.0 SEQITER_PLL_SEED_WINDOWS=$D/seqmut_iter_pll_rows.jsonl \
+  sbatch/submit_lnr_seqmut_iter_pll.sh
+```
+
+**Step 2 — the prompt fixes alone, against the recorded baseline (~$1.78).**
+`iter-llm` only, same 29 targets, `n_gen=80`: paired against job 119773 this
+isolates the three brief defects. The EA arm does not need rerunning — it reads
+no brief, so jobs 119443/119637/120444 remain valid controls.
+
+```bash
+SEQITER_PLL_ARMS=iter-llm SEQITER_PLL_TARGETS=$T \
+SEQITER_PLL_N_GEN=80 SEQITER_PLL_M_OFF=12 SEQITER_PLL_MAX_EVALS=900 \
+SEQITER_PLL_SEED_WINDOWS=$D/seqmut_iter_pll_rows.jsonl \
+SEQITER_PLL_ROWS_FILE=seqmut_iter_pll_rows.LLM2.jsonl \
+SEQITER_PLL_TRAJ_FILE=seqmut_iter_pll_traj.LLM2.jsonl \
+SEQITER_PLL_MAX_SPEND=3.0 SEQITER_PLL_TIME=10:00:00 \
+  sbatch/submit_lnr_seqmut_iter_pll.sh
+```
+
+**The endpoints to read, in order of sensitivity:** `n_dup_proposed` (the
+mechanism — if duplicates do not fall, the measured-list block is not being
+used), then exact optima reached (5/27 before), then mean regret (0.1361
+before). The first is a check on the fix; only the last two are the result.
+
+**Step 3 — the hi arm**, with `--hi-n-gen` from step 1 and
+`SEQITER_PLL_MAX_SPEND` doubled so each ledger still gets ~$1.78.
+
+**Still free, still unrun, and still the honest control:** the diversity-aware EA
+operator (reject known genomes before scoring, scale `k_mut` with length). The
+EA loses partly by failing to spend its budget — it saturates at ~386 distinct
+proposals out of ~980 — and that is a property of `_point_mutate`, not evidence
+about the LLM. Until it exists, "the LLM proposes more distinct genomes" is
+measured against an operator that cannot.
+
+### Files
+
+```
+  agent/lnr/env.py            _rec_residue_labels, receptor_contacts_by_position
+  agent/lnr/seqmut.py         receptor_context, _residue_table(rec_ctx=)
+  agent/lnr/seqmut_iter.py    Population.measured_keys, tried() reordered,
+                              _measured_block, _coverage_block,
+                              iter_brief(measured=/mutable=/rec_ctx=),
+                              HI_EFFORT_ARM, make_llm_clients,
+                              _probe_call_cost, iter.effort/effort_sent
+  sbatch/s4_lnr_seqmut_iter_pll.sbatch   HI_EFFORT/HI_N_GEN/PROBE + warnings
+  sbatch/submit_lnr_seqmut_iter_pll.sh   the three new vars in the env file
+```
+
+253 tests pass. The receptor context is verified aligned on 87/87 targets and
+the hi arm verified end-to-end on `3ayu` with the scripted backend (no spend).

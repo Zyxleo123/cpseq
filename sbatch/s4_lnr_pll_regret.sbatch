@@ -56,28 +56,56 @@ ARM_ARG=()
 # Gated here rather than in the submitter (CLAUDE.md: decision gates belong
 # inside the jobs) and exits 0 on failure so no afterok dependent is stranded in
 # DependencyNeverSatisfied with no explanation.
-if grep -q '"iter-llm"' "$ROWS" 2>/dev/null; then
-  VAL_JSON="${PLLREGRET_VALIDITY_OUT:-${OUT_JSON%.json}_llm_validity.json}"
+# EVERY llm arm present is gated, not just `iter-llm`. The old test was
+# `grep -q '"iter-llm"'`, which does not match `"iter-llm-hi"` -- the closing
+# quote differs -- so a run of the hi-effort arm skipped the funding gate
+# altogether and would have been graded unvalidated. The arms are discovered
+# from the rows so a new arm cannot be forgotten here again.
+LLM_ARMS_PRESENT=$("$PY" - "$ROWS" <<'PYEOF'
+import json, sys
+arms = []
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        a = json.loads(line).get("mut_arm", "")
+    except json.JSONDecodeError:
+        continue
+    if a.startswith("iter-llm") and a not in arms:
+        arms.append(a)
+print(" ".join(sorted(arms)))
+PYEOF
+)
+echo "LLM arms present in rows: '${LLM_ARMS_PRESENT:-<none>}'"
+GATE_FAILED=""
+for LARM in $LLM_ARMS_PRESENT; do
+  VAL_JSON="${OUT_JSON%.json}_${LARM}_validity.json"
+  echo
+  echo "--- funding gate: $LARM ---"
   set +e
-  "$PY" "$AGENT/lnr/pll_llm_validity.py" --rows "$ROWS" \
+  "$PY" "$AGENT/lnr/pll_llm_validity.py" --rows "$ROWS" --arm "$LARM" \
     --cap "${PLLREGRET_LLM_CAP:-0}" --n-expected "${PLLREGRET_N_EXPECTED:-0}" \
     --out-json "$VAL_JSON"
   VRC=$?
   set -e
-  if [ "$VRC" = "2" ] && [ "${PLLREGRET_FORCE:-0}" != "1" ]; then
-    echo
-    echo "GATE FAILED: the iter-llm arm is not fully funded (see above)."
-    echo "Refusing to print an LLM-vs-EA regret comparison that would read as a"
-    echo "tie for a reason that has nothing to do with the operator."
-    echo "Raise --max-spend-usd to the projected figure above, delete the"
-    echo "affected iter-llm rows from $ROWS (the run is resumable and SKIPS"
-    echo "rows already present), and resubmit the search."
-    echo "To grade anyway for inspection: PLLREGRET_FORCE=1"
-    echo "Exiting 0 so no dependent job is stranded."
-    exit 0
-  fi
-  [ "$VRC" = "2" ] && echo "WARNING: PLLREGRET_FORCE=1 -- grading a run the gate rejected."
+  [ "$VRC" = "2" ] && GATE_FAILED="$GATE_FAILED $LARM"
+done
+if [ -n "$GATE_FAILED" ] && [ "${PLLREGRET_FORCE:-0}" != "1" ]; then
+  echo
+  echo "GATE FAILED: these LLM arms are not fully funded:$GATE_FAILED"
+  echo "Refusing to print an LLM-vs-EA regret comparison that would read as a"
+  echo "tie for a reason that has nothing to do with the operator."
+  echo "Raise --max-spend-usd to the projected figure above, delete the"
+  echo "affected rows from $ROWS (the run is resumable and SKIPS"
+  echo "rows already present), and resubmit the search."
+  echo "NOTE: with two effort levels the cap is SPLIT per ledger, so each arm"
+  echo "gets half of SEQITER_PLL_MAX_SPEND -- raise it accordingly."
+  echo "To grade anyway for inspection: PLLREGRET_FORCE=1"
+  echo "Exiting 0 so no dependent job is stranded."
+  exit 0
 fi
+[ -n "$GATE_FAILED" ] && echo "WARNING: PLLREGRET_FORCE=1 -- grading a run the gate rejected."
 
 "$PY" "$AGENT/lnr/pll_regret.py" --rows "$ROWS" --out-json "$OUT_JSON" \
   --n-perm "$NPERM" --thresh "$THRESH" --max-evals "$MAXEVALS" "${ARM_ARG[@]}" \

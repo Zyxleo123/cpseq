@@ -74,9 +74,18 @@ from lnr import seqmut as S  # noqa: E402  the shared scorer / cache / window / 
 AA20 = S.AA20
 EPS = 1e-6
 
-ITER_LLM_ARMS = ("iter-llm", "iter-llm-ala")
+ITER_LLM_ARMS = ("iter-llm", "iter-llm-ala", "iter-llm-hi")
 ITER_EA_ARM = "iter-ea"
 ITER_ARMS = ITER_LLM_ARMS + (ITER_EA_ARM,)
+
+# `iter-llm-hi` is the SAME operator and prompt at a higher reasoning effort and
+# correspondingly fewer generations, so the two LLM arms cost about the same in
+# dollars. It exists because the only unambiguous advantage measured for the LLM
+# arm so far is that it proposes more DISTINCT genomes -- a diversity effect that
+# a better-reasoning model need not improve at all. Separating "thinks harder"
+# from "proposes more" needs the dollars held fixed and the generations varied,
+# which is what this arm does.
+HI_EFFORT_ARM = "iter-llm-hi"
 
 
 # ---------------------------------------------------------------------------
@@ -313,15 +322,53 @@ class Population:
         return v[: min(max_n, min(n, len(v)))]
 
     def tried(self, exclude_keys=(), limit: int = 14) -> list:
-        """Scored members NOT in `exclude_keys`, worst-first -- the failure memory
-        the LLM brief was missing. Showing only the elite left the model blind to
-        what it had already tried and lost: 34-45% of its proposals re-proposed a
-        genome already in the pool, and it fixated on the incumbent's positions
-        (on 1elr, 6 of 7 post-seed proposals carried the elite's `1:Q`)."""
+        """Scored members NOT in `exclude_keys` -- the failure memory the LLM brief
+        was missing. Showing only the elite left the model blind to what it had
+        already tried and lost: 34-45% of its proposals re-proposed a genome
+        already in the pool, and it fixated on the incumbent's positions (on
+        1elr, 6 of 7 post-seed proposals carried the elite's `1:Q`).
+
+        ORDER: NEAR-MISSES FIRST, then the worst for contrast. This block used to
+        be sorted worst-first, which spent the whole budget of rows on the least
+        informative genomes in the pool -- edits that are obviously bad say
+        nothing about where the next gain is, while the sets sitting just behind
+        the frontier are exactly the ones whose near-success localises it. Giving
+        both ends also keeps the dynamic range visible, so "this edit is bad"
+        and "this edit is nearly the best" are distinguishable rows.
+
+        Duplicate AVOIDANCE is no longer this block's job -- it cannot be, at 14
+        rows out of a pool of hundreds -- see `measured_keys`.
+        """
         ex = set(exclude_keys)
         v = [m for m in self.scored() if S.subs_key(m["subs"]) not in ex]
-        v.sort(key=lambda m: -m["recovered"])     # worst (least negative) first
-        return v[:limit]
+        v.sort(key=lambda m: m["recovered"])      # best (most negative) first
+        if len(v) <= limit:
+            return v
+        n_near = limit - limit // 3               # 2/3 near-misses, 1/3 worst
+        return v[:n_near] + v[-(limit - n_near):]
+
+    def measured_keys(self) -> list:
+        """EVERY genome already in the population, as raw subs keys, best-first
+        (anything attempted but unscored last).
+
+        The brief instructs the model that each proposal "must be one NOT listed
+        anywhere above" -- an instruction that was unsatisfiable by construction
+        while the only things listed were 12 elite + 14 tried rows out of a pool
+        that reaches ~500. The measured 34-45% duplicate rate is that contract
+        failing, not the model ignoring it, and every duplicate costs a proposal
+        slot (they are dropped, not scored). The full key list is a few hundred
+        short strings -- cheap next to a wasted generation.
+
+        Keys are RAW (the wild-type is ""), so this list is exactly the set the
+        duplicate filter tests against; rendering "" as "(none)" is the display
+        layer's job. Returning a prettified key here would silently exempt the
+        wild-type from the filter.
+        """
+        def rank(m):
+            r = m.get("recovered")
+            return (1, 0.0) if r is None else (0, r)
+        return [S.subs_key(m["subs"])
+                for m in sorted(self.members.values(), key=rank)]
 
 
 # ---------------------------------------------------------------------------
@@ -535,23 +582,95 @@ def _elite_block(elite, noisy: bool = False, units: str = "REU") -> str:
     return "\n".join(rows)
 
 
-def _tried_block(tried) -> str:
+def _tried_block(tried, units: str = "REU") -> str:
     """The failure memory: sets already measured that did NOT make the frontier."""
     if not tried:
         return ""
-    cells = [f"{S.subs_key(m['subs']) or '(none)'} ({m['recovered']:+.1f})"
+    cells = [f"{S.subs_key(m['subs']) or '(none)'} ({m['recovered']:+.2f})"
              for m in tried]
-    return ("Already measured and NOT on the frontier -- do not propose these "
-            "again, and do not simply vary the same one position:\n  "
-            + "; ".join(cells) + "\n\n")
+    return (f"Measured, not on the frontier -- nearest misses first, worst last "
+            f"({units}):\n  " + "; ".join(cells) + "\n\n")
+
+
+def _measured_block(keys, cap: int = 600) -> str:
+    """The COMPLETE list of genomes already evaluated.
+
+    Scores are deliberately absent: this block answers "has this been tried?",
+    which is the question the duplicate-avoidance instruction actually needs,
+    and nothing more. Keeping fitness out of it means the block cannot be read
+    as a per-position credit assignment -- that is a separate, deliberately
+    unpulled lever (see docs/seqmut_notes.md, "the credit table").
+    """
+    keys = [k if k else "(none)" for k in keys]
+    if not keys:
+        return ""
+    shown = keys[:cap]
+    more = (f"\n  ... and {len(keys) - len(shown)} more (the list is truncated; "
+            f"prefer positions marked unexplored below)" if len(keys) > cap else "")
+    return (f"ALL {len(keys)} sets measured so far -- every one of these is spent, "
+            f"and a repeat is DISCARDED without being scored, costing you the "
+            f"slot:\n  " + "; ".join(shown) + more + "\n\n")
+
+
+def _coverage_block(keys, t, mutable=()) -> str:
+    """Per position, which amino acids have been measured there -- and which
+    positions are still untouched.
+
+    The complement of `_measured_block` and the actionable half: a list of spent
+    genomes tells the model what to avoid, whereas this tells it where room is
+    left. Also scores-free, so it reports coverage and not credit.
+    """
+    import re as _re
+    seen: dict[int, set] = {}
+    for k in keys:
+        if not k or k == "(none)":
+            continue
+        for tok in _re.split(r"[,\s;]+", k):
+            mm = S._SUB_TOK.match(tok.strip()) if tok.strip() else None
+            if mm:
+                seen.setdefault(int(mm.group(1)), set()).add(mm.group(2).upper())
+    pos = sorted(mutable) if mutable else list(range(t.length))
+    if not pos:
+        return ""
+    rows, untouched, exhausted = [], [], []
+    for i in pos:
+        aas = seen.get(i)
+        if not aas:
+            untouched.append(i)
+            continue
+        wt = t.seq[i] if i < len(t.seq) else ""
+        left = [a for a in AA20 if a not in aas and a != wt]
+        if left:
+            rows.append(f"{i}:{''.join(sorted(left))}")
+        else:
+            exhausted.append(i)
+    # Phrased as what is LEFT, not what is spent: the spent half is already the
+    # measured block above, and a list of remaining options is the only form of
+    # this that a proposal can be read straight off.
+    out = ("Single substitutions NOT yet measured, by position (the room that is "
+           "left):\n  " + ("; ".join(rows) if rows else "(none)") + "\n")
+    if untouched:
+        out += ("  NEVER EDITED at all -- every amino acid is untried here: " +
+                ", ".join(str(i) for i in untouched) + "\n")
+    if exhausted:
+        out += ("  EXHAUSTED as single edits (only combinations remain): " +
+                ", ".join(str(i) for i in exhausted) + "\n")
+    return out + "\n"
 
 
 def iter_brief(t, window, k_mut, elite, m, gen, wt_ala=None, folded=False,
                tried=(), noise_sd: float = 0.0, wt_score=None,
-               objective=None) -> str:
+               objective=None, measured=(), mutable=(), rec_ctx=None) -> str:
     a, b = window["a"], window["b"]
     note = (" The bindE column is each residue's current interface energy "
             "(more positive = it carries more binding)." if wt_ala else "")
+    # The receptor side of the interface. The objective text asks the model to
+    # match the chemistry across from each position; until this column existed
+    # the brief never said what that chemistry was.
+    faces_note = (" The 'faces' column lists the receptor residues each peptide "
+                  "position contacts (one-letter + residue number), nearest "
+                  "first -- that is the pocket a substitution at that position "
+                  "has to suit." if rec_ctx else "")
     # `objective` is the explicit form; `folded` is kept as the legacy selector so
     # existing callers and tests are unaffected.
     obj = objective or OBJECTIVES["folded" if folded else "proxy"]
@@ -587,7 +706,8 @@ def iter_brief(t, window, k_mut, elite, m, gen, wt_ala=None, folded=False,
         f"{t.n_contacts} interface contacts. On cyclization the residues in window "
         f"[{a},{b}] are HELD at their bound pose and keep the interface; residues "
         f"outside are released so the ring can close.\n\n"
-        f"Per-residue table:{note}\n{S._residue_table(t, wt_ala)}\n\n"
+        f"Per-residue table:{note}{faces_note}\n"
+        f"{S._residue_table(t, wt_ala, rec_ctx=rec_ctx)}\n\n"
         # The wild-type is THE bar (every headline number is paired against
         # nomut), but it is often not in the elite -- naming it as "the row marked
         # (none)" then points at a row that is not on screen.
@@ -598,17 +718,22 @@ def iter_brief(t, window, k_mut, elite, m, gen, wt_ala=None, folded=False,
            "'(none)' below is the wild-type sequence, the bar to beat.\n\n")
         + f"Best substitution sets found so far:\n\n"
         f"{_elite_block(elite, noisy=noise_sd > 0, units=units)}\n\n"
-        f"{_tried_block(tried)}"
+        f"{_tried_block(tried, units=units)}"
+        f"{_measured_block(measured)}"
+        f"{_coverage_block(measured, t, mutable)}"
         f"{noise}"
         f"Study what the strong sets share and where the weak ones waste edits, "
         f"then propose {m} NEW candidate substitution set(s) that you expect to "
         f"score MORE NEGATIVE than the best above. Each set uses at most {k_mut} "
         f"substitution(s). {propose_mode}\n\n"
         f"Requirements for the {m} sets:\n"
-        f"- Every set must be one NOT listed anywhere above.\n"
+        f"- Every set must be absent from the measured list above. That list is "
+        f"COMPLETE, so this is checkable: check it.\n"
         f"- At least {n_new_pos} of them must edit a position that is NOT on the "
         f"frontier. {pos_note}The frontier may be sitting on a measurement "
-        f"artifact, so part of the budget has to test elsewhere.\n"
+        f"artifact, so part of the budget has to test elsewhere -- prefer "
+        f"positions listed as never edited, or amino acid classes not yet tried "
+        f"at a position.\n"
         f"- Spread the rest: refine the strong sets, but no two of your sets "
         f"should differ only in the amino acid at one shared position.\n\n"
         f"Output EXACTLY {m} line(s), each one candidate and nothing else:\n"
@@ -653,7 +778,7 @@ def parse_many(text: str, L: int, k_mut: int, m: int) -> list:
 def llm_offspring(llm, t, window, k_mut, elite, m, gen, wt_ala, meta, rng,
                   iface, max_retries=1, save_raw=False, folded=False,
                   known=(), tried=(), noise_sd: float = 0.0, wt_score=None,
-                  objective=None) -> list:
+                  objective=None, rec_ctx=None) -> list:
     """One LLM call returning up to m new genomes, each paired with the best elite
     recovered shown (the frontier it was asked to beat). Falls back to a random-EA
     child if the model declines/malforms, so a dead generation does not stall the
@@ -663,14 +788,21 @@ def llm_offspring(llm, t, window, k_mut, elite, m, gen, wt_ala, meta, rng,
     one are DROPPED, not scored: a repeat costs the generation a proposal slot and
     teaches the search nothing (measured at 34-45% of all LLM proposals). When
     repeats leave the generation short, the model is re-asked ONCE with the
-    repeats named -- a cheap, in-context correction -- before the EA fallback."""
+    repeats named -- a cheap, in-context correction -- before the EA fallback.
+
+    `known` is now also SHOWN to the model (in full) rather than used only to
+    filter afterwards. It was always available here; withholding it is what made
+    the brief's "propose something not listed above" instruction unsatisfiable,
+    because only ~26 of up to ~500 measured genomes were ever listed.
+    """
     from lp2cp.enums import StepStatus
 
     best_rec = elite[0]["recovered"] if elite else None
     obj = objective or OBJECTIVES["folded" if folded else "proxy"]
     brief = iter_brief(t, window, k_mut, elite, m, gen, wt_ala=wt_ala, folded=folded,
                        tried=tried, noise_sd=noise_sd, wt_score=wt_score,
-                       objective=obj)
+                       objective=obj, measured=known, mutable=iface,
+                       rec_ctx=rec_ctx)
     # The system prompt has to describe the same fitness as the brief, or the model
     # reasons about a scorer it is not being graded by.
     system = getattr(S, obj["system_attr"], S.MUT_SYSTEM)
@@ -791,6 +923,14 @@ def evolve(arm, t, window, cache, *, k_mut, n_seed, n_gen, m_off, max_evals,
     folded = bool(getattr(scorer, "folds", getattr(scorer, "is_gpu", False)))
     noisy = bool(getattr(scorer, "stochastic", False))
     objective = scorer_objective(scorer)
+    # The receptor side of each position, read ONCE per target (it parses the
+    # PDB) and reused for every generation's brief. Only the LLM arms read it;
+    # the EA arm reads no brief at all, so this costs the control nothing.
+    rec_ctx = S.receptor_context(t) if arm in ITER_LLM_ARMS else None
+    if arm in ITER_LLM_ARMS and rec_ctx is None:
+        print(f"[seqmut-iter] {t.target_id:8s} receptor contact context "
+              f"unavailable -- brief falls back to contact counts only",
+              flush=True)
     if getattr(scorer, "is_gpu", False):
         n_workers = 1
     # THE KNOWN OPTIMUM, when the evaluator can supply one. An exactly solvable
@@ -812,7 +952,8 @@ def evolve(arm, t, window, cache, *, k_mut, n_seed, n_gen, m_off, max_evals,
     pop = Population(t, window, cache, k_mut, relax_repeats, timeout, max_evals,
                     scorer=scorer, z_explore=z_explore, z_commit=z_commit)
     meta = {"llm_calls": 0, "llm_cost_usd": 0.0, "status_counts": {},
-            "model_id": getattr(llm, "model_id", None) if llm else None}
+            "model_id": getattr(llm, "model_id", None) if llm else None,
+            "effort": getattr(llm, "effort", None) if llm else None}
 
     if opt:
         meta["optimum"] = opt
@@ -860,11 +1001,11 @@ def evolve(arm, t, window, cache, *, k_mut, n_seed, n_gen, m_off, max_evals,
                                      wt_ala, meta, rng, iface,
                                      max_retries=max_retries, save_raw=save_raw,
                                      folded=folded,
-                                     known=set(pop.members),
+                                     known=pop.measured_keys(),
                                      tried=pop.tried(exclude_keys=elite_keys),
                                      noise_sd=noise_sd,
                                      wt_score=(wt_m or {}).get("recovered"),
-                                     objective=objective)
+                                     objective=objective, rec_ctx=rec_ctx)
         else:
             children = ea_offspring(elite, t, k_mut, iface, rng, m_off,
                                     known=set(pop.members))
@@ -910,12 +1051,134 @@ def evolve(arm, t, window, cache, *, k_mut, n_seed, n_gen, m_off, max_evals,
             # closed-form optimum); 0.0 means this arm has solved the target
             "regret": _regret(best_after, opt),
         })
+    if llm is not None:
+        # True only if the client still had reasoning_effort enabled after every
+        # call -- see the `effort_sent` note in `_finalist_row`.
+        meta["effort_sent"] = bool(getattr(llm, "_send_effort", True))
+        if meta.get("effort") and not meta["effort_sent"]:
+            print(f"[seqmut-iter] {t.target_id:8s} {arm:12s} WARNING: the API "
+                  f"REJECTED reasoning_effort={meta['effort']}; this arm ran at "
+                  f"the model's default effort and is NOT a high-effort arm",
+                  flush=True)
     return pop, traj, meta
 
 
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
+
+def make_llm_clients(llm_arms, *, backend, model, effort, hi_effort,
+                     max_spend_usd, max_tokens):
+    """Build one client per EFFORT LEVEL and divide the spend cap between them.
+
+    Returns `(efforts, llm_by_effort)` where `efforts` maps an effort level to
+    the arms that run at it. Arms sharing an effort share a client, because the
+    client owns the ledger and the ledger is what the cap is about.
+
+    THE CAP IS PER CLIENT. Handing each client the full `--max-spend-usd` would
+    make the run's real ceiling a multiple of the one asked for, against a
+    convention (docs/seqmut_notes.md) where every spend figure is per-run. Worse,
+    a cap that IS reached does not stop the run: `llm_offspring` substitutes a
+    random-EA child on BUDGET_CAP, so an overspent arm silently becomes its own
+    control for the rest of the run, in target order. The cap is therefore split
+    and every share printed.
+
+    Kept separate from `run` so the division is testable without a manifest, an
+    output path, or a search.
+    """
+    efforts: dict[str, list] = {}
+    for a in llm_arms:
+        efforts.setdefault(hi_effort if a == HI_EFFORT_ARM else effort,
+                           []).append(a)
+    llm_by_effort = {}
+    if not llm_arms:
+        return efforts, llm_by_effort
+    if not backend:
+        raise SystemExit(f"[seqmut-iter] LLM arms {llm_arms} need --backend/--model")
+    # Imported here, not at module scope, to match `run`: `lnr.run` pulls in the
+    # LLM backends, and the EA-only path must stay importable without them.
+    from lnr import run as R
+    share = max_spend_usd / len(efforts) if max_spend_usd else 0.0
+    for eff, arms_here in efforts.items():
+        llm_by_effort[eff] = R.make_llm(backend, model, eff, share, max_tokens)
+        print(f"[seqmut-iter] llm backend={backend} model={model} "
+              f"effort={eff} arms={arms_here} cap=${share:.2f} "
+              f"({len(efforts)} ledger(s), ${max_spend_usd:.2f} total)",
+              flush=True)
+    return efforts, llm_by_effort
+
+
+def _probe_call_cost(llm_by_effort, efforts, targets, args) -> int:
+    """Price one call per effort level, then print the generations each arm can
+    afford. Exits without searching.
+
+    This exists because `--hi-n-gen` cannot be guessed. A high-effort call costs
+    more than a low-effort one by an amount that depends on the model and on how
+    much it chooses to think, so equal generations is NOT equal spend -- and the
+    consequence of overspending is not a clean stop: on BUDGET_CAP
+    `llm_offspring` substitutes a random-EA child, so the arm degrades into its
+    own control partway through, in target order. Measuring one call costs about
+    a tenth of a cent and makes the dollar-match arithmetic checkable before a
+    run is submitted, which is the convention the rest of this module follows.
+    """
+    from lp2cp.enums import StepStatus
+    if not targets:
+        print("[probe] no targets loaded -- nothing to price", flush=True)
+        return 1
+    t = targets[0]
+    win = {"a": 0, "b": max(0, t.length - 1), "retention": 1.0, "clean": True}
+    # A brief of realistic SIZE, since input tokens are most of the cost: a
+    # full-looking elite block, failure memory and measured list, not an empty
+    # generation-1 brief that would price the run too low.
+    elite = [{"subs": ((i % t.length, "W"),), "recovered": -1.5 - 0.01 * i,
+              "sem": 0.0, "obs": [-1.5], "gen": 1} for i in range(12)]
+    measured = [S.subs_key([(i % t.length, a)])
+                for i, a in enumerate(AA20 * 8)]
+    rec_ctx = S.receptor_context(t)
+    print(f"[probe] pricing on {t.target_id} (L={t.length}), m_off={args.m_off}",
+          flush=True)
+    rows = []
+    for effort, arms_here in efforts.items():
+        llm = llm_by_effort[effort]
+        brief = iter_brief(t, win, args.k_mut, elite, args.m_off, 7,
+                           objective=OBJECTIVES["pll"], tried=elite[6:],
+                           measured=measured, mutable=list(range(t.length)),
+                           rec_ctx=rec_ctx, wt_score=-1.2)
+        reply = llm.complete(getattr(S, "MUT_SYSTEM_PLL", S.MUT_SYSTEM),
+                             [{"role": "user", "content": brief}])
+        ok = reply.status == StepStatus.OK
+        sent = bool(getattr(llm, "_send_effort", True))
+        n_parsed = len(parse_many(reply.text, t.length, args.k_mut, args.m_off))
+        rows.append((effort, arms_here, reply.cost_usd, ok, sent, n_parsed,
+                     len(brief)))
+        print(f"[probe] effort={effort:6s} status={reply.status.value:10s} "
+              f"${reply.cost_usd:.6f}/call  brief={len(brief)}c  "
+              f"parsed={n_parsed}/{args.m_off} proposals  "
+              f"reasoning_effort_accepted={sent}"
+              + ("" if ok else f"  detail={(reply.detail or '')[:160]}"),
+              flush=True)
+    n_t = len(targets)
+    cap = args.max_spend_usd
+    share = cap / len(efforts) if cap else 0.0
+    print(f"\n[probe] {n_t} target(s), cap ${cap:.2f} split ${share:.2f} per "
+          f"effort ledger. Calls per generation ~1 (plus up to one re-ask).",
+          flush=True)
+    for effort, arms_here, cost, ok, sent, _, _ in rows:
+        if not ok or cost <= 0:
+            print(f"[probe] effort={effort}: cannot price (status not OK or "
+                  f"$0 cost) -- do NOT submit this arm", flush=True)
+            continue
+        afford = int(share / (cost * n_t)) if share else 0
+        at_n_gen = cost * n_t * args.n_gen
+        print(f"[probe] effort={effort:6s} arms={arms_here}: "
+              f"${cost * n_t:.4f}/generation across all targets -> "
+              f"--n-gen {args.n_gen} would cost ${at_n_gen:.2f}; "
+              f"${share:.2f} affords n_gen={afford}"
+              + (f"  <-- use --hi-n-gen {afford}" if HI_EFFORT_ARM in arms_here
+                 else ""), flush=True)
+    print("[probe] no search was run (--probe-call-cost)", flush=True)
+    return 0
+
 
 def _load_windows(path: Path) -> dict:
     """Reuse the committed window per target from an existing seqmut rows file, so
@@ -1015,6 +1278,16 @@ def _finalist_row(t, arm, window, cache, pop, traj, meta, k_mut, relax_repeats,
         "llm_calls": meta["llm_calls"], "llm_cost_usd": meta["llm_cost_usd"],
         "status_counts": meta["status_counts"], "fallback_gens": meta.get("fallback_gens", 0),
         "llm_error_detail": meta.get("llm_error_detail", ""),
+        "effort": meta.get("effort"),
+        # Whether `reasoning_effort` was actually ACCEPTED by the API. The
+        # OpenAI client drops the parameter and silently retries without it on a
+        # 400 (openai_api.py), so an arm labelled high-effort can run at the
+        # model's default while every other column looks normal -- the hi-effort
+        # arm would then be a duplicate of the low-effort arm wearing a
+        # different name, and "effort does not matter" is exactly the plausible
+        # conclusion it would produce. Recorded per row so the grader can gate
+        # on it instead of trusting the label.
+        "effort_sent": meta.get("effort_sent"),
     }
     if meta.get("model_id"):
         row["llm_cost_usd"] = meta["llm_cost_usd"]
@@ -1045,6 +1318,10 @@ def run(args):
         if a not in ITER_ARMS:
             raise SystemExit(f"[seqmut-iter] unknown arm {a!r}; allowed: {ITER_ARMS}")
     llm_arms = [a for a in arms if a in ITER_LLM_ARMS]
+    # `run` is called directly by tests with a SimpleNamespace, so every new
+    # option is read defensively -- the same reason `evaluator` is below.
+    hi_effort = getattr(args, "hi_effort", "high")
+    hi_n_gen = getattr(args, "hi_n_gen", 0)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1063,14 +1340,14 @@ def run(args):
         print(f"[seqmut-iter] reusing {len(windows)} committed windows from "
               f"{args.seed_windows}", flush=True)
 
-    llm = None
-    if llm_arms:
-        if not args.backend:
-            raise SystemExit(f"[seqmut-iter] LLM arms {llm_arms} need --backend/--model")
-        llm = R.make_llm(args.backend, args.model, args.effort,
-                         args.max_spend_usd, args.max_tokens)
-        print(f"[seqmut-iter] llm backend={args.backend} model={args.model} "
-              f"cap=${args.max_spend_usd}", flush=True)
+    efforts, llm_by_effort = make_llm_clients(
+        llm_arms, backend=args.backend, model=args.model, effort=args.effort,
+        hi_effort=hi_effort, max_spend_usd=args.max_spend_usd,
+        max_tokens=args.max_tokens)
+    llm = llm_by_effort.get(args.effort)
+
+    if getattr(args, "probe_call_cost", False):
+        return _probe_call_cost(llm_by_effort, efforts, targets, args)
 
     done = set()
     if out.exists():
@@ -1190,12 +1467,19 @@ def run(args):
                     args.k_mut) in done:
                 continue
             t0 = time.time()
+            # The hi-effort arm runs its own client (its own effort, its own
+            # ledger) and its own generation count, which is how the two LLM
+            # arms are matched on DOLLARS instead of on generations.
+            arm_effort = hi_effort if arm == HI_EFFORT_ARM else args.effort
+            arm_llm = llm_by_effort.get(arm_effort)
+            arm_n_gen = (hi_n_gen if arm == HI_EFFORT_ARM and hi_n_gen
+                         else args.n_gen)
             pop, traj, meta = evolve(
                 arm, t, win, cache, k_mut=args.k_mut, n_seed=args.n_seed,
-                n_gen=args.n_gen, m_off=args.m_off, max_evals=args.max_evals,
+                n_gen=arm_n_gen, m_off=args.m_off, max_evals=args.max_evals,
                 elite_frac=args.elite_frac, relax_repeats=args.relax_repeats,
                 timeout=args.per_target_timeout,
-                llm=(llm if arm in ITER_LLM_ARMS else None),
+                llm=(arm_llm if arm in ITER_LLM_ARMS else None),
                 wt_ala=(wt_ala if arm == "iter-llm-ala" else None),
                 max_retries=args.max_retries, save_raw=args.save_raw,
                 n_workers=args.n_workers, scorer=scorer,
@@ -1548,6 +1832,18 @@ def main() -> int:
     ap.add_argument("--effort", default="low")
     ap.add_argument("--max-spend-usd", type=float, default=0.0)
     ap.add_argument("--max-tokens", type=int, default=6000)
+    ap.add_argument("--hi-effort", default="high",
+                    help=f"reasoning effort for the {HI_EFFORT_ARM} arm")
+    ap.add_argument("--hi-n-gen", type=int, default=0,
+                    help=f"generations for the {HI_EFFORT_ARM} arm (0 = --n-gen). "
+                         f"Set this BELOW --n-gen to dollar-match the arms: a "
+                         f"high-effort call costs more, so equal generations is "
+                         f"not equal spend. Price it with --probe-call-cost.")
+    ap.add_argument("--probe-call-cost", action="store_true",
+                    help="make one brief-shaped call per configured LLM arm, print "
+                         "the measured $/call and the generation count each arm "
+                         "can afford under --max-spend-usd, then exit without "
+                         "running a search")
     ap.add_argument("--max-retries", type=int, default=1)
     ap.add_argument("--save-raw", action="store_true")
     ap.add_argument("--report-only", default="", help="summarize an existing out "

@@ -54,6 +54,15 @@ export SEQITER_PLL_MAX_SPEND="${SEQITER_PLL_MAX_SPEND:-1.0}"
 export LNR_EFFORT="${LNR_EFFORT:-low}"
 export LNR_MAX_TOKENS="${LNR_MAX_TOKENS:-6000}"
 export LNR_MAX_SECONDS="${LNR_MAX_SECONDS:-8}"
+# The iter-llm-hi arm. These have to be written into the env file like every
+# other setting: the batch script reads its configuration from the file passed
+# as a positional argument, so a variable exported only in the submitter's own
+# shell silently keeps the job's default (and a hi arm that quietly runs at
+# n_gen=NGEN is matched on generations, not dollars -- the exact confound the
+# arm exists to avoid).
+export SEQITER_PLL_HI_EFFORT="${SEQITER_PLL_HI_EFFORT:-high}"
+export SEQITER_PLL_HI_N_GEN="${SEQITER_PLL_HI_N_GEN:-0}"
+export SEQITER_PLL_PROBE="${SEQITER_PLL_PROBE:-0}"
 EOT
 echo "wrote $ENVF:"; sed 's/^/    /' "$ENVF"
 # Scrubbed so a submission from inside an allocation does not inherit that job's

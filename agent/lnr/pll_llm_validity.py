@@ -82,6 +82,15 @@ def load(path, arm="iter-llm"):
             "n_ok": sum(v for k, v in sc.items() if k.startswith("ok")),
             "n_error": int(sc.get("error", 0)),
             "error_detail": (it.get("llm_error_detail") or "")[:300],
+            # The effort the arm CLAIMED, and whether the API accepted it. The
+            # OpenAI client drops `reasoning_effort` and silently retries
+            # without it on a 400, so `iter-llm-hi` can run at the model's
+            # default effort while every other column looks healthy -- making it
+            # a duplicate of `iter-llm` under a different name. "Effort does not
+            # matter" is then the plausible conclusion it produces, which is the
+            # same class of failure as the unfunded arm this module exists for.
+            "effort": it.get("effort"),
+            "effort_sent": it.get("effort_sent"),
         })
     return out
 
@@ -103,6 +112,11 @@ def verdict(rows, cap=None):
                if r["fallback_frac"] > FALLBACK_FRAC_SUSPECT
                and not r["n_fatal"] and r["target_id"] not in never_ids]
     clean = [r for r in rows if r["fallback_gens"] == 0]
+    # Rows that asked for a reasoning effort the API refused to apply.
+    # `effort_sent is None` means the row predates the field, so it is not
+    # evidence of a problem and is not counted.
+    effort_dropped = [r for r in rows
+                      if r.get("effort") and r.get("effort_sent") is False]
     out = {
         "n_targets": n,
         "total_spend_usd": spend,
@@ -111,6 +125,9 @@ def verdict(rows, cap=None):
         "n_fatal_budget_cap": len(fatal),
         "n_suspect_fallback": len(suspect),
         "n_never_called": len(never),
+        "n_effort_dropped": len(effort_dropped),
+        "effort_dropped_targets": [r["target_id"] for r in effort_dropped],
+        "efforts_claimed": sorted({r["effort"] for r in rows if r.get("effort")}),
         "fatal_targets": [r["target_id"] for r in fatal],
         "suspect_targets": [r["target_id"] for r in suspect],
         "never_called_targets": [r["target_id"] for r in never],
@@ -130,6 +147,10 @@ def verdict(rows, cap=None):
         out["verdict"] = "NO_ROWS"
     elif fatal or never:
         out["verdict"] = "INVALID_TAIL"
+    elif effort_dropped:
+        # Not a funding failure, so it gets its own verdict rather than being
+        # filed under one that would send the reader to the billing page.
+        out["verdict"] = "INVALID_EFFORT"
     elif suspect:
         out["verdict"] = "PARTIAL"
     else:
@@ -221,6 +242,18 @@ def report(path, cap=None, out_json=None, arm="iter-llm", n_expected=0):
               "  Their regret is a blend of two operators; grade with those "
               "targets excluded as well as included.")
         print(f"  suspect: {', '.join(v['suspect_targets'])}")
+    elif v["verdict"] == "INVALID_EFFORT":
+        print("  This arm asked for a reasoning effort the API REFUSED to "
+              "apply. The client drops `reasoning_effort` and retries without\n"
+              "  it on a 400, so these rows ran at the model's DEFAULT effort "
+              "while claiming otherwise -- which makes a high-effort arm a\n"
+              "  second copy of the low-effort arm under a different name. Do "
+              "NOT report an effort comparison from this file, and in\n"
+              "  particular do not read a tie as 'reasoning effort does not "
+              "help'. Check the model actually supports the parameter.")
+        print(f"  effort claimed: {', '.join(v['efforts_claimed'])}")
+        print(f"  effort dropped on: "
+              f"{', '.join(v['effort_dropped_targets'])}")
     else:
         print("  Every target called the model and no target exhausted the "
               "budget, so an LLM-vs-EA difference from this file is "
@@ -232,7 +265,7 @@ def report(path, cap=None, out_json=None, arm="iter-llm", n_expected=0):
                                              indent=2))
         print(f"\nwrote {out_json}")
     # Non-zero only for a hard gate failure, so a caller can branch on it.
-    return 2 if v["verdict"] == "INVALID_TAIL" else 0
+    return 2 if v["verdict"] in ("INVALID_TAIL", "INVALID_EFFORT") else 0
 
 
 def main() -> int:

@@ -22,10 +22,11 @@ from lnr import pll_llm_validity as V  # noqa: E402
 
 
 def _row(tid, *, arm="iter-llm", regret=0.1, n_gen=80, calls=80, cost=0.05,
-         status_counts=None, fallback_gens=0):
+         status_counts=None, fallback_gens=0, effort=None, effort_sent=None):
     return {"target_id": tid, "mut_arm": arm,
             "iter": {"regret": regret, "n_gen_run": n_gen, "llm_calls": calls,
                      "llm_cost_usd": cost, "fallback_gens": fallback_gens,
+                     "effort": effort, "effort_sent": effort_sent,
                      # `is not None`, not `or`: an explicitly EMPTY dict means
                      # "no statuses recorded" (a target that never called) and
                      # must not be silently replaced by the all-ok default.
@@ -166,3 +167,43 @@ def test_no_rows_is_gated_and_names_the_key_trap(tmp_path, capsys):
     rc = V.report(p, cap=1.0)
     assert rc == 1
     assert "OPENAI_API_KEY" in capsys.readouterr().out
+
+
+def test_a_rejected_reasoning_effort_invalidates_the_hi_effort_arm(tmp_path, capsys):
+    """An effort the API refused is a silent duplicate of the low-effort arm.
+
+    The OpenAI client drops `reasoning_effort` and retries without it on a 400,
+    so `iter-llm-hi` can look entirely healthy -- calls made, money spent, no
+    fallbacks -- while running at the model's default effort. Graded naively it
+    would say "effort does not help", which is the same shape as the real
+    conclusion and therefore has to be gated, not noted.
+    """
+    rows = [_row("t1", arm="iter-llm-hi", effort="high", effort_sent=True),
+            _row("t2", arm="iter-llm-hi", effort="high", effort_sent=False)]
+    p = _write(tmp_path / "eff", rows)
+    v = V.verdict(V.load(p, arm="iter-llm-hi"))
+    assert v["verdict"] == "INVALID_EFFORT"
+    assert v["effort_dropped_targets"] == ["t2"]
+    assert v["efforts_claimed"] == ["high"]
+    # and it must be a HARD gate, so the job can refuse to grade
+    assert V.report(p, arm="iter-llm-hi") == 2
+    out = capsys.readouterr().out
+    assert "REFUSED" in out and "does not help" in out
+
+
+def test_rows_without_the_effort_field_are_not_penalised(tmp_path):
+    """`effort_sent` is absent on every row written before the field existed.
+
+    Absence is not evidence that the effort was dropped, so it must not flip a
+    verdict -- otherwise adding the check retroactively invalidates the runs
+    already recorded in docs/seqmut_notes.md.
+    """
+    p = _write(tmp_path / "old", [_row("t1"), _row("t2")])
+    assert V.verdict(V.load(p))["verdict"] == "VALID"
+
+
+def test_low_effort_arm_is_unaffected_by_the_effort_check(tmp_path):
+    """effort=low that WAS sent is fine; the check keys on rejection only."""
+    p = _write(tmp_path / "lo",
+               [_row("t1", effort="low", effort_sent=True)])
+    assert V.verdict(V.load(p))["verdict"] == "VALID"

@@ -90,6 +90,13 @@ EFFORT="${LNR_EFFORT:-low}"
 MAXSPEND="${SEQITER_PLL_MAX_SPEND:-1.0}"
 MAXTOK="${LNR_MAX_TOKENS:-6000}"
 RETRIES="${SEQITER_PLL_MAX_RETRIES:-1}"
+# The iter-llm-hi arm: same operator and prompt, higher reasoning effort, fewer
+# generations so the two LLM arms cost about the SAME in dollars. HI_N_GEN=0
+# means "same as NGEN", which is NOT dollar-matched -- price it first with
+# SEQITER_PLL_PROBE=1 and set this to the n_gen the probe says is affordable.
+HI_EFFORT="${SEQITER_PLL_HI_EFFORT:-high}"
+HI_N_GEN="${SEQITER_PLL_HI_N_GEN:-0}"
+PROBE="${SEQITER_PLL_PROBE:-0}"
 mkdir -p "$OUTDIR" "${OUTDIR}/pssm"
 
 # Torch on CPU will otherwise spawn one thread per visible core on the whole
@@ -159,7 +166,7 @@ SEED_ARG=()
 
 LLM_ARG=()
 case ",$ARMS," in
-  *,iter-llm,*|*,iter-llm-ala,*)
+  *,iter-llm,*|*,iter-llm-ala,*|*,iter-llm-hi,*)
     if [ -z "$BACKEND" ]; then echo "GATE: iter-llm arm but no backend. Exit 0."; exit 0; fi
     if [ "$BACKEND" = "openai" ] && ! "$PY" -c "
 import sys; sys.path.insert(0, '$STAGE0')
@@ -169,8 +176,31 @@ sys.exit(0 if require_api_key(key='OPENAI_API_KEY') else 1)"; then
     fi
     LLM_ARG=(--backend "$BACKEND" --model "$MODEL" --effort "$EFFORT"
              --max-spend-usd "$MAXSPEND" --max-tokens "$MAXTOK"
-             --max-retries "$RETRIES" --save-raw)
+             --max-retries "$RETRIES" --save-raw
+             --hi-effort "$HI_EFFORT")
+    [ "$HI_N_GEN" != "0" ] && LLM_ARG+=(--hi-n-gen "$HI_N_GEN")
+    [ "$PROBE" != "0" ] && LLM_ARG+=(--probe-call-cost)
     echo "iter-llm arm: backend=$BACKEND model=$MODEL cap=\$$MAXSPEND"
+    echo "              effort=$EFFORT hi_effort=$HI_EFFORT hi_n_gen=$HI_N_GEN"
+    # The cap is split across effort LEDGERS, so two effort levels each get half.
+    case ",$ARMS," in
+      *,iter-llm-hi,*)
+        case ",$ARMS," in
+          *,iter-llm,*|*,iter-llm-ala,*)
+            echo "              NOTE: two effort levels -> the \$$MAXSPEND cap is"
+            echo "              SPLIT, half per ledger. Raise SEQITER_PLL_MAX_SPEND"
+            echo "              if a single arm needs the whole amount." ;;
+        esac ;;
+    esac
+    if [ "$HI_N_GEN" = "0" ]; then
+      case ",$ARMS," in
+        *,iter-llm-hi,*)
+          echo "              WARNING: HI_N_GEN=0 -> the hi arm runs the SAME"
+          echo "              n_gen=$NGEN as the low arm. A high-effort call costs"
+          echo "              more, so the arms are matched on GENERATIONS, not"
+          echo "              dollars. Run with SEQITER_PLL_PROBE=1 to price it." ;;
+      esac
+    fi
     ;;
 esac
 

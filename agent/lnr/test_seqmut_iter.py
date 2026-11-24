@@ -322,6 +322,47 @@ def test_evolve_with_boltz_scorer_uses_real_dG_and_serial(patched):
     assert row["committed_window"] == [0, 9] and row["subs"]   # foldable by the report
 
 
+def test_two_effort_levels_split_the_spend_cap_instead_of_doubling_it(
+        tmp_path, monkeypatch):
+    """The cap is PER CLIENT, and the hi-effort arm needs a second client.
+
+    Handing both clients `--max-spend-usd` would make the run's real ceiling 2x
+    what was asked for, against a convention (docs/seqmut_notes.md) where every
+    spend figure is per-run and a cap that IS reached silently turns the arm into
+    a random-EA control for the rest of the run. So the cap is divided.
+    """
+    from lnr import run as R
+    seen = []
+    monkeypatch.setattr(R, "make_llm",
+                        lambda backend, model, effort, cap, max_tokens:
+                        seen.append((effort, cap)) or types.SimpleNamespace(
+                            model_id=model, effort=effort))
+    efforts, clients = I.make_llm_clients(
+        ["iter-llm", "iter-llm-hi"], backend="openai", model="m", effort="low",
+        hi_effort="high", max_spend_usd=3.0, max_tokens=6000)
+    assert sorted(seen) == [("high", 1.5), ("low", 1.5)]
+    assert sum(c for _, c in seen) == 3.0       # the asked-for ceiling, not 2x
+    assert efforts == {"low": ["iter-llm"], "high": ["iter-llm-hi"]}
+    assert set(clients) == {"low", "high"}
+
+    # Arms at the SAME effort share one client, so one ledger and the whole cap.
+    # Dividing per ARM instead would under-fund a run that asked for no second
+    # effort level, which is the opposite failure and just as quiet.
+    seen.clear()
+    I.make_llm_clients(["iter-llm", "iter-llm-ala"], backend="openai", model="m",
+                       effort="low", hi_effort="high", max_spend_usd=3.0,
+                       max_tokens=6000)
+    assert seen == [("low", 3.0)]
+
+    # And the EA-only path builds no client at all, so it must not demand a
+    # --backend: the control arm reads no brief and makes no call.
+    seen.clear()
+    assert I.make_llm_clients([], backend="", model="", effort="low",
+                              hi_effort="high", max_spend_usd=0.0,
+                              max_tokens=6000) == ({}, {})
+    assert seen == []
+
+
 def test_run_end_to_end_ea_only_writes_rows_traj_and_nomut(patched, tmp_path, monkeypatch):
     # a seqmut rows file that supplies the committed window (so run_campaign is
     # never called) and lets us run with no manifest machinery
@@ -492,12 +533,115 @@ def test_brief_shows_noise_tried_set_and_an_exploration_floor():
               "gen": 0}]
     b = I.iter_brief(t, win, 2, elite, 4, 2, folded=True, tried=tried, noise_sd=2.0)
     assert "+/-SE" in b and "NOISY MEASUREMENTS" in b
-    assert "5:D" in b and "do not propose these" in b   # the failure memory
+    assert "5:D" in b and "not on the frontier" in b    # the failure memory
     assert "NOT on the frontier" in b                   # the exploration floor
     assert "Positions already on the frontier: 2" in b
     # the deterministic-proxy brief keeps its old shape (no noise language)
     plain = I.iter_brief(t, win, 2, elite, 4, 2, folded=False)
     assert "NOISY MEASUREMENTS" not in plain and "score(REU)" in plain
+
+
+def test_brief_lists_every_measured_genome_not_just_the_shown_rows():
+    """The duplicate-avoidance instruction has to be SATISFIABLE.
+
+    The brief tells the model each proposal must be absent from what it has
+    already measured. While the brief listed only 12 elite + 14 tried rows, a
+    pool of hundreds made that uncheckable -- and the measured duplicate rate
+    was 34-45%. Every measured key must appear.
+    """
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    win = {"a": 0, "b": 9, "retention": 1.0, "clean": True}
+    elite = [{"subs": ((2, "W"),), "obs": [-30.0], "recovered": -30.0, "sem": 0.0,
+              "gen": 1}]
+    measured = ["2:W", "", "4:Q", "7:L,8:M", "3:E"]
+    b = I.iter_brief(t, win, 2, elite, 4, 5, measured=measured,
+                     mutable=list(range(10)))
+    for k in ("2:W", "4:Q", "7:L,8:M", "3:E"):
+        assert k in b, f"{k} missing from the brief's measured list"
+    assert "(none)" in b                  # the wild-type, rendered readably
+    assert "COMPLETE" in b                # and the instruction says so
+
+
+def _loaded_pop(scored):
+    """A Population whose members are set directly: {subs_key: recovered}."""
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    win = {"a": 0, "b": 9, "retention": 1.0, "clean": True}
+    pop = I.Population(t, win, S.ScanCache(Path("/dev/null")), 2, 1, 1.0, 500)
+    for key, rec in scored.items():
+        subs = tuple((int(tok.split(":")[0]), tok.split(":")[1])
+                     for tok in key.split(",")) if key else ()
+        pop.members[key] = {"subs": subs, "obs": [rec], "recovered": rec,
+                            "sem": 0.0, "gen": 1}
+    return pop
+
+
+def test_measured_keys_are_raw_so_the_wild_type_is_not_exempt_from_the_filter():
+    """`measured_keys` feeds both the display and the duplicate filter.
+
+    The wild-type's key is the empty string. Prettifying it to "(none)" inside
+    `measured_keys` would make `"" in set(keys)` false, quietly exempting the
+    wild-type from the repeat filter so it could be re-proposed forever.
+    """
+    pop = _loaded_pop({"": -20.0, "2:W": -30.0})
+    keys = pop.measured_keys()
+    assert "" in keys and "(none)" not in keys
+    assert keys[0] == "2:W"                  # best-first
+    assert set(keys) == set(pop.members)     # exactly the filter's domain
+
+
+def test_coverage_block_reports_untouched_positions_and_no_scores():
+    """Coverage, deliberately WITHOUT credit.
+
+    Telling the model where it has not looked is honest search bookkeeping. A
+    per-position *gain* table would instead hand it the separable objective's
+    solution -- a different, deliberately unpulled lever -- so no fitness value
+    may leak into this block.
+    """
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    blk = I._coverage_block(["2:W", "2:F", "5:D"], t, mutable=[2, 5, 8])
+    assert "NEVER EDITED" in blk and "8" in blk
+    left = dict(seg.strip().split(":") for seg in
+                blk.split("\n")[1].strip().split("; "))
+    # reported as what is LEFT: W and F are spent at position 2, so absent --
+    # and so is 'D', which is position 2's own wild-type residue
+    assert set("WFD").isdisjoint(left["2"]) and "A" in left["2"]
+    # position 5 ('G') had D measured; both D and the wild-type G are gone
+    assert set("DG").isdisjoint(left["5"]) and "A" in left["5"]
+    # no fitness value may leak into this block -- that is the unpulled lever
+    assert "nats" not in blk and "REU" not in blk and "+" not in blk
+
+
+def test_coverage_block_marks_a_position_exhausted_for_single_edits():
+    t = _T("x1", "ACDEFGHIKL", [1] * 10)
+    allk = [f"2:{a}" for a in I.AA20 if a != "D"]      # position 2 is 'D'
+    blk = I._coverage_block(allk, t, mutable=[2])
+    assert "EXHAUSTED" in blk and "only combinations remain" in blk
+
+
+def test_tried_block_leads_with_near_misses_not_the_worst_genomes():
+    """The 14 rows should be spent on the informative end of the pool.
+
+    Worst-first (the old order) filled the block with obviously-bad edits,
+    which localise nothing; the sets just behind the frontier are the ones whose
+    near-success says where the next gain is.
+    """
+    pop = _loaded_pop({f"{p}:W": -float(p) for p in range(10)})
+    rows = pop.tried(limit=3)
+    assert S.subs_key(rows[0]["subs"]) == "9:W"      # best first
+    assert S.subs_key(rows[-1]["subs"]) == "0:W"     # worst kept for contrast
+    # and nothing is dropped when the pool fits in the limit
+    assert len(pop.tried(limit=99)) == 10
+
+
+def test_residue_table_names_the_receptor_residues_each_position_faces():
+    """The objective asks the model to match the chemistry across from each
+    position; a contact COUNT cannot express it."""
+    t = _T("x1", "ACD", [3, 1, 0])
+    tbl = I.S._residue_table(t, None, rec_ctx=[["F86", "A85"], ["K12"], []])
+    assert "faces" in tbl and "F86 A85" in tbl and "K12" in tbl
+    assert "(no contacts)" in tbl                 # position 2 touches nothing
+    # and without the column the table is byte-identical to the old one
+    assert "faces" not in I.S._residue_table(t, None)
 
 
 def test_llm_offspring_drops_repeats_and_reasks_once(patched):
