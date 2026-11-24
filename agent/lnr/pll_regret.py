@@ -577,6 +577,91 @@ def print_novelty(traj_path, exclude=None):
     return nov
 
 
+def regret_at_budget(traj_path, budget, arm=None, exclude=None) -> dict:
+    """Best regret each target had reached by its FIRST `budget` evaluations.
+
+    The analysis that separates "the operator proposes better" from "the
+    operator spends more of the budget" -- two things the headline regret cannot
+    tell apart, and which came apart badly in job 120668/120763: the fixed LLM
+    arm reaches the 900-eval cap where the same arm previously stopped near 516,
+    so part of its lower regret is simply more evaluations. Reading both runs at
+    the SAME eval count removes that, for free, from trajectories already on
+    disk.
+
+    Each trajectory row carries the cumulative `evals` and the regret of the
+    best genome found so far, so the value at a budget is the last row with
+    `evals <= budget`. Targets that never reached the budget are reported
+    separately rather than silently given their final value -- crediting a
+    target with a regret it only achieved later is exactly the error this
+    function exists to prevent.
+    """
+    drop = set(exclude or ())
+    per: dict = {}
+    for line in Path(traj_path).read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if arm and d.get("arm") != arm:
+            continue
+        if d.get("target_id") in drop:
+            continue
+        ev, rg = d.get("evals"), d.get("regret")
+        if ev is None or rg is None:
+            continue
+        k = (d.get("target_id"), d.get("arm"))
+        cur = per.setdefault(k, {"regret": None, "evals": 0, "max_evals": 0})
+        cur["max_evals"] = max(cur["max_evals"], int(ev))
+        if int(ev) <= budget and (cur["regret"] is None
+                                 or float(rg) < cur["regret"]):
+            cur["regret"] = float(rg)
+            cur["evals"] = int(ev)
+    reached = {k: v for k, v in per.items()
+               if v["regret"] is not None and v["max_evals"] >= budget}
+    short = {k: v for k, v in per.items() if k not in reached}
+    return {"budget": budget, "reached": reached, "short_of_budget": short}
+
+
+def compare_at_budget(traj_a, traj_b, budget, arm="iter-llm",
+                      label_a="A", label_b="B", exclude=None):
+    """Paired regret of one arm in two runs, at a MATCHED evaluation budget."""
+    A = regret_at_budget(traj_a, budget, arm=arm, exclude=exclude)
+    B = regret_at_budget(traj_b, budget, arm=arm, exclude=exclude)
+    a = {t: v["regret"] for (t, _), v in A["reached"].items()}
+    b = {t: v["regret"] for (t, _), v in B["reached"].items()}
+    shared = sorted(set(a) & set(b))
+    print(f"\nMATCHED-BUDGET regret for {arm} at the first {budget} "
+          f"evaluation(s), over {len(shared)} shared target(s)")
+    if A["short_of_budget"] or B["short_of_budget"]:
+        print(f"  (excluded for never reaching {budget} evals: "
+              f"{len(A['short_of_budget'])} in {label_a}, "
+              f"{len(B['short_of_budget'])} in {label_b})")
+    if not shared:
+        print("  GATE: no shared targets reached this budget in both runs.")
+        return None
+    better = [t for t in shared if b[t] < a[t] - 1e-12]
+    worse = [t for t in shared if b[t] > a[t] + 1e-12]
+    moved = len(better) + len(worse)
+    pv = (sum(math.comb(moved, k) for k in range(len(better), moved + 1))
+          / (2 ** moved)) if moved else float("nan")
+    print(f"  {label_a:24s} mean regret {st.mean(a[t] for t in shared):.4f}   "
+          f"solved {sum(1 for t in shared if a[t] <= 0)}/{len(shared)}")
+    print(f"  {label_b:24s} mean regret {st.mean(b[t] for t in shared):.4f}   "
+          f"solved {sum(1 for t in shared if b[t] <= 0)}/{len(shared)}")
+    print(f"  moved: {len(better)} better, {len(worse)} worse, "
+          f"{len(shared) - moved} tied"
+          + (f"   sign test p = {pv:.4f}" if moved else ""))
+    print(f"  -> this is PROPOSAL QUALITY at equal spend. The headline regret "
+          f"also includes\n     the extra evaluations the fixed arm is able to "
+          f"use, which is a real gain\n     but a different one.")
+    return {"budget": budget, "n_shared": len(shared), "n_better": len(better),
+            "n_worse": len(worse), "sign_p": pv,
+            f"mean_{label_a}": st.mean(a[t] for t in shared),
+            f"mean_{label_b}": st.mean(b[t] for t in shared)}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--rows", required=True, help="seqmut_iter_pll_rows.jsonl")
@@ -605,6 +690,12 @@ def main() -> int:
                     help="seqmut_iter_pll_traj.jsonl; adds the per-arm PROPOSAL "
                          "NOVELTY table, the only duplicate metric that is fair "
                          "to the EA arms (rows record dup only for LLM arms)")
+    ap.add_argument("--compare-traj", default="",
+                    help="a second trajectory file; with --at-budget, compares "
+                         "one arm's regret in both runs at a MATCHED eval "
+                         "budget, separating proposal quality from budget use")
+    ap.add_argument("--at-budget", type=int, default=0,
+                    help="the matched evaluation budget to read regret at")
     ap.add_argument("--compare-arms", default="",
                     help="two arms in THIS file to pair, as 'armA:armB' (e.g. "
                          "iter-ea:iter-llm). The matched-budget operator "
@@ -618,6 +709,11 @@ def main() -> int:
                 arm=(a.arm or None), exclude=exclude)
     if a.traj:
         print_novelty(a.traj, exclude=exclude)
+    if a.traj and a.compare_traj and a.at_budget:
+        compare_at_budget(a.compare_traj, a.traj, a.at_budget,
+                          arm=(a.arm or "iter-llm"),
+                          label_a=a.compare_label, label_b=a.label,
+                          exclude=exclude)
     if a.compare:
         compare(a.rows, a.compare, label_a=a.label, label_b=a.compare_label,
                 arm=(a.arm or None), exclude=exclude,
