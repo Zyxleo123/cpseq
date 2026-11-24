@@ -429,6 +429,52 @@ def report(rows):
     # mutant's own gap over its folds.
     signed = [g["gap"] for g in gaps]
     stt = sign_test(signed)
+
+    # CALIBRATION, not just direction. The sign test asks whether the table errs
+    # one way; it cannot see that the table errs in OPPOSITE directions at its
+    # optimum and on the edits it rejects, which averages to a null and hides
+    # a single simple defect: the table's predicted delta is too LARGE in
+    # whichever direction it points. Regressing realized delta on predicted
+    # delta measures that directly, and a slope below 1 is the whole statement.
+    #
+    # The regressor is exact. `d_frozen` is a deterministic table lookup with
+    # ZERO measurement error, so this slope is not attenuated by regression
+    # dilution -- the usual reason a slope below 1 means nothing. Fold noise
+    # lives in y, where it widens the interval but does not bias the estimate.
+    # The native baseline enters every point as a common offset, so it moves the
+    # intercept and not the slope: that is what the double difference buys.
+    xs = [g["d_frozen"] for g in gaps]
+    ys = [g["d_own"] for g in gaps]
+    if len(xs) >= 4 and len(set(xs)) > 1:
+        mx, my = st.mean(xs), st.mean(ys)
+        sxx = sum((x - mx) ** 2 for x in xs)
+        syy = sum((y - my) ** 2 for y in ys)
+        sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        b = sxy / sxx
+        rr = sxy / ((sxx * syy) ** 0.5) if syy > 0 else float("nan")
+        print(f"\nCALIBRATION: realized delta vs the delta the table predicted")
+        print(f"  realized = {my - b * mx:+.4f} {b:+.4f} * predicted"
+              f"      r = {rr:+.3f}  (r^2 = {rr * rr:.2f})  n = {len(xs)}")
+        print(f"  slope 1 = the table's magnitudes are right. slope 0 = the "
+              f"table carries no\n  usable magnitude at all. Measured "
+              f"{b:.2f} means the table INFLATES every predicted\n  change by "
+              f"~{1 / b:.1f}x if it points anywhere at all.")
+        print(f"  r^2 = {rr * rr:.2f}: the fraction of the realized change the "
+              f"table can see.\n  The rest is pose response, invisible to a "
+              f"matrix built once.")
+        print(f"  CONSEQUENCE: a uniform rescaling preserves the per-position "
+              f"ORDER, so this\n  does not by itself unseat `best_subs` as a "
+              f"ranker -- but every margin in\n  nats/res shrinks by {b:.2f}, "
+              f"so an indifference band of 0.05 realized is a band\n  of "
+              f"{0.05 / b:.2f} in TABLE units. Bands quoted in table units are "
+              f"too narrow by {1 / b:.1f}x.")
+        for arm in ("opt", "pos", "any"):
+            sel = [g for g in gaps if g.get("arm") == arm]
+            if sel:
+                print(f"    {arm:4s} n={len(sel):3d}  table promised "
+                      f"{st.mean([g['d_frozen'] for g in sel]):+.3f}, pose "
+                      f"delivered {st.mean([g['d_own'] for g in sel]):+.3f}")
+
     print(f"\nDIRECTION (the statistic that survives the length confound)")
     print(f"  gaps above zero : {stt['pos']}/{stt['n']}   "
           f"sign test p = {stt['p']:.4f}")
