@@ -813,6 +813,26 @@ def selftest():
         eq("and says so via seen != mapped",
            bad.ss_seen > bad.ss_mapped, True)
 
+    # 2hwl's shape: the chain uses insertion codes (1D, 1E, ...) while the
+    # SSBOND record writes a BARE `CYS A 1`. Keying on resSeq alone resolved
+    # that to the Gly at 1D; the fix disambiguates by residue name, which the
+    # record itself asserts.
+    iseq = "GCA"
+    ilines = ["SSBOND   1 CYS A    1    CYS B  122"
+              "                          1555   1555  2.04"]
+    for i, (num, ic, nm) in enumerate([(1, "D", "GLY"), (1, "E", "CYS"),
+                                       (2, " ", "ALA")]):
+        ilines.append(f"ATOM  {i + 1:5d}  CA  {nm} A{num:4d}{ic}   "
+                      f"{0.0:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00  0.00           C")
+    with tempfile.TemporaryDirectory() as d:
+        pdb = Path(d) / "i.pdb"
+        pdb.write_text("\n".join(ilines) + "\n")
+        eq("insertion codes are kept in the id",
+           chain_resnums(pdb, "A")[:2], [(1, "D", "GLY"), (1, "E", "CYS")])
+        c = ctx_from_pdb(pdb, "A", iseq, "i")
+        eq("bare SSBOND resolves to the CYS, not the GLY", c.ss_anchor, (1,))
+        eq("and it is counted as mapped", (c.ss_seen, c.ss_mapped), (1, 1))
+
     print("tally")
     t = tally(battery("CGGCGGWDG", Ctx()))
     eq("tally splits by ctx",

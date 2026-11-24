@@ -57,6 +57,24 @@ banner
 # ctx run would credit the specification arm with everything a hand-written
 # column set already catches.
 #
+# MEASURED 2026-11-23 (job 120882): ON THIS TARGET SET THE DIFFERENCE IS ZERO,
+# and the two files come out byte-identical. Do not read that as "per-target
+# context buys nothing" -- the comparison is degenerate here for two reasons
+# that are both properties of the instrument, not findings:
+#   1. Only 5 SSBOND records involve a peptide chain across 87 targets (one
+#      intra-peptide staple on 4w50; receptor tethers on 1fiw x2, 2hwl, 4piq),
+#      and the optimum KEEPS Cys at 6/6 bonded positions including the free
+#      unconstrained optimum. ligandMPNN is pose-conditioned, so it already
+#      sees the disulfide geometry and prefers Cys there. The table does not
+#      need to be told, so the exemplar never fires.
+#   2. `--no-ctx` only zeroes ss_pairs/ss_anchor/cyclic. The other two
+#      needs_ctx checks (net_charge, gravy) read the SAME default window in
+#      both arms, so "universal spec" and "per-target spec" were the same spec.
+# LNR is linear-peptide complexes and its topology barely varies, so it cannot
+# answer the ctx question at all. That belongs on CPSet, where cyclization
+# topology genuinely differs between series. Fix (2) before rerunning either
+# way, or the arm comparison stays a tautology.
+#
 # WHAT THIS JOB DOES NOT MEASURE. Five JOINT axes (aggregation, permeability,
 # immunogenicity, off-target, synthesis yield) are declared in `pepliab.py` and
 # deliberately NOT implemented: none is a function of per-position values or
