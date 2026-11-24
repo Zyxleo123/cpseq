@@ -716,7 +716,31 @@ DESIGN_STYLE = {
 }
 
 
-def plot(out_dir, *, version="v3", arm="boltz2", stem=None):
+def load_nlp(path="/zfsauton/scratch/yixiz/lp2cp_stage2/lnr/rosetta_interface.jsonl"):
+    """N_lp: Rosetta interface dG of the NATIVE LINEAR peptide in its deposited
+    bound pose, relaxed. The ceiling a cyclization is trying to keep.
+
+    This project's standing rule is that no binding number is reported without
+    it, and this experiment needed the reminder: the `native` design here is the
+    native SEQUENCE folded as a macrocycle, which is a same-sequence ring
+    control, not the ceiling. The gap between the two is the cyclization loss,
+    and it is far larger than anything a k=2 edit moves.
+
+    Protocol note, since the figure puts them on one axis: N_lp comes from
+    `rosetta_interface.py` (cleaned pose, FastRelax, InterfaceAnalyzer) and the
+    folded numbers from `cpseq.scorer` with a closure restraint. A linear
+    peptide has no ring to restrain, so that difference is intrinsic to the
+    comparison rather than a protocol slip -- the two are comparable in
+    magnitude, not bitwise matched.
+    """
+    out = {}
+    for r in _load_jsonl(path):
+        if r.get("native_dG") is not None:
+            out[r["target_id"]] = float(r["native_dG"])
+    return out
+
+
+def plot(out_dir, *, version="v3", arm="boltz2", stem=None, nlp_path=None):
     """One plot per file: x = target, y = refined interface dG, one ball per fold.
 
     The y axis is INVERTED so that stronger binding is up -- the quantity is
@@ -782,9 +806,28 @@ def plot(out_dir, *, version="v3", arm="boltz2", stem=None):
         ax.axvline(xi + 0.5, color="#e1e0d9", lw=0.6, zorder=0)
 
     ax.set_xticks(range(len(order)))
-    ax.set_xticklabels([f"{t}\nn={doc_len(doc, t)}" for t in order])
+    ax.set_xticklabels([f"{t}\n{doc_len(doc, t)}-mer" for t in order])
     ax.set_xlim(-0.6, len(order) - 0.4)
-    ax.invert_yaxis()                      # stronger binding (more negative) up
+    # ROBUST LIMITS, AND SAY WHAT THEY HIDE. One fold in this set relaxed to
+    # +1006 REU with status "ok", ring declared and sequence matched -- the
+    # scorer's gates do not catch a diverged relax. Auto-scaling to it would
+    # flatten every real difference into one line, so the view is set on the
+    # bulk and anything outside it is COUNTED on the figure rather than dropped.
+    nlp = load_nlp(nlp_path) if nlp_path else load_nlp()
+    allv = np.array([v for vals in by.values() for v in vals], dtype=float)
+    lo, hi = np.percentile(allv, [0.5, 99.5])
+    pad = 0.08 * (hi - lo)
+    ax.set_ylim(hi + pad, lo - pad)        # inverted: stronger binding up
+    off = allv[(allv < lo - pad) | (allv > hi + pad)]
+    if off.size:
+        worst = off[np.argmax(np.abs(off))]
+        # Top right: the whole bottom strip carries the per-target "% of N_lp",
+        # and with the axis inverted the top right is the empty corner.
+        ax.text(0.995, 0.985,
+                f"{off.size} fold{'s' if off.size > 1 else ''} outside the view "
+                f"(worst {worst:+.0f} REU)",
+                transform=ax.transAxes, ha="right", va="top", fontsize=6.4,
+                color="#898781")
     ax.set_ylabel("Rosetta interface ΔG$_{sep}$ after relax  (REU)")
     ax.grid(axis="y", lw=0.6, color="#e1e0d9")
     ax.annotate("stronger\nbinding", xy=(0.004, 0.97), xycoords="axes fraction",
@@ -793,15 +836,46 @@ def plot(out_dir, *, version="v3", arm="boltz2", stem=None):
     ax.annotate("", xy=(0.012, 0.995), xytext=(0.012, 0.88),
                 xycoords="axes fraction",
                 arrowprops=dict(arrowstyle="-|>", color="#898781", lw=0.8))
+    # THE CEILING. Drawn in place when it fits; when a target's native linear
+    # energy is off the scale set by the folded rings -- which is itself the
+    # result -- it is reported as a capped arrow with its value, rather than
+    # rescaling the plot until every real difference flattens into one line.
+    ylo, yhi = sorted(ax.get_ylim())
+    for xi, tid in enumerate(order):
+        c = nlp.get(tid)
+        if c is None:
+            continue
+        med_opt = float(np.median(by.get((tid, "pll_opt"), [float("nan")])))
+        frac = 100.0 * med_opt / c if c else float("nan")
+        if ylo <= c <= yhi:
+            ax.plot([xi - 0.42, xi + 0.42], [c, c], "--", lw=1.1,
+                    color="#0b0b0b", zorder=2)
+            ax.text(xi + 0.42, c, f"  N$_{{lp}}$ {c:.0f}", fontsize=6.3,
+                    color="#0b0b0b", va="center", ha="left")
+        else:
+            ax.annotate("", xy=(xi, ylo), xytext=(xi, ylo + 0.07 * (yhi - ylo)),
+                        arrowprops=dict(arrowstyle="-|>", color="#0b0b0b",
+                                        lw=0.9), annotation_clip=False)
+            ax.text(xi, ylo + 0.075 * (yhi - ylo), f"N$_{{lp}}$ {c:.0f}",
+                    fontsize=6.3, color="#0b0b0b", ha="center", va="top")
+        ax.text(xi, 0.022, f"{frac:.0f}% of N$_{{lp}}$",
+                transform=ax.get_xaxis_transform(), fontsize=6.6,
+                color="#52514e", ha="center", va="bottom")
+
     nfold = max(len(v) for v in by.values())
-    ax.set_title(f"{arm} → relax ({version}) → Rosetta · one ball per fold "
-                 f"(up to {nfold} per sequence)", loc="left", pad=7)
+    ax.set_title(f"{arm} → relax ({version}) → Rosetta · one ball per fold, "
+                 f"{nfold} per sequence (4 runs × 4 samples)", loc="left",
+                 pad=24)
     handles = [Line2D([], [], marker=DESIGN_STYLE[d][2], color="none",
                       markerfacecolor=DESIGN_STYLE[d][1],
                       markeredgecolor="#ffffff", markersize=5.4,
                       label=DESIGN_STYLE[d][0]) for d in slots]
-    ax.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.0, 1.015),
-              ncol=len(slots), handletextpad=0.35, columnspacing=1.5,
+    handles.append(Line2D([], [], color="#0b0b0b", lw=1.1, ls="--",
+                          label="native LINEAR ceiling (N$_{lp}$)"))
+    # Legend BETWEEN the title and the axes: four entries on one row collide
+    # with a left-aligned title placed at the same anchor.
+    ax.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.0, 1.002),
+              ncol=len(handles), handletextpad=0.35, columnspacing=1.3,
               borderpad=0.0)
 
     stem = stem or f"oracle_{arm}_{version}"
@@ -832,6 +906,10 @@ def plot(out_dir, *, version="v3", arm="boltz2", stem=None):
         # The question in one number per target: does the table's optimum beat
         # the median of the random draws, and by how much against the fold
         # noise that threatened to swamp it?
+        cell["_N_lp"] = nlp.get(tid)
+        if nlp.get(tid) and (by.get((tid, "pll_opt")) or []):
+            cell["_opt_pct_of_N_lp"] = round(
+                100.0 * float(np.median(by[(tid, "pll_opt")])) / nlp[tid], 1)
         rands = [v for d in ("rand1", "rand2") for v in (by.get((tid, d)) or [])]
         opt = by.get((tid, "pll_opt")) or []
         if rands and opt:
