@@ -273,7 +273,21 @@ def _gaps(rows):
 
     A mutant with no cached native fold is DROPPED, not compared against the
     crystal-pose score: that comparison would measure crystal-vs-Boltz, not
-    additivity, and is the single easiest way to manufacture a fake result."""
+    additivity, and is the single easiest way to manufacture a fake result.
+
+    DUPLICATE SEQUENCES ARE COLLAPSED. The designed sweep runs three arms
+    (opt / pos / any) per (target, k), and they COLLIDE by construction: when the
+    table offers only j positive-gain positions in the window, a random
+    positive-gain subset of size k=j IS the argmax, so `pos` returns exactly what
+    `opt` does. The fold is cached by sequence, so the collision costs no GPU --
+    but it writes a second row whose own-pose folds and frozen score are
+    BITWISE identical, and counting both would put two copies of one measurement
+    into the sign test. That inflates n and makes the samples perfectly
+    correlated, which is the one thing a binomial test cannot survive
+    (cf. the pooled-pairs lesson: n is only n if the draws are independent).
+    Dedupe on (target_id, seq) and keep the `opt` row when one is present, since
+    that is the decision-relevant sequence; `arms_dropped` records what was
+    collapsed so per-arm counts can be read honestly rather than silently."""
     nat = {}
     for r in rows:
         if r.get("is_native") and r.get("pll_own_median") is not None:
@@ -289,16 +303,35 @@ def _gaps(rows):
                      and x["target_id"] == t for v in _own_folds(x)]
                  for t in native_own}
 
-    out = []
+    # Collapse identical sequences BEFORE any statistic touches them.
+    uniq, dropped = {}, []
     for r in rows:
         if r.get("is_native") or r.get("pll_own_median") is None:
             continue
+        # No `seq` means the row cannot be proven a duplicate, so it is kept:
+        # a missing field must never silently merge two distinct measurements.
+        key = ((r["target_id"], r["seq"]) if r.get("seq")
+               else ("\0unkeyed", len(uniq)))
+        prev = uniq.get(key)
+        if prev is None:
+            uniq[key] = r
+        else:
+            # Keep `opt`: it is the sequence `best_subs` actually returns.
+            keep, drop = ((r, prev) if r.get("arm") == "opt"
+                          and prev.get("arm") != "opt" else (prev, r))
+            uniq[key] = keep
+            dropped.append({"target_id": key[0], "k": drop.get("k"),
+                            "arm": drop.get("arm"),
+                            "duplicate_of": keep.get("arm")})
+
+    out = []
+    for r in uniq.values():
         t = r["target_id"]
         if t not in native_own or t not in native_frozen:
             continue
         d_own = r["pll_own_median"] - native_own[t]
         d_frozen = r["pll_frozen"] - native_frozen[t]
-        g = {"target_id": t, "k": r.get("k"),
+        g = {"target_id": t, "k": r.get("k"), "arm": r.get("arm"),
              "in_window": r.get("in_window"),
              "length": len(r.get("seq") or r.get("native_seq") or ""),
              "d_own": d_own, "d_frozen": d_frozen,
@@ -306,7 +339,7 @@ def _gaps(rows):
              "sd": r.get("pll_own_sd")}
         g["boot"] = bootstrap_gap(_own_folds(r), nat_folds.get(t, []), d_frozen)
         out.append(g)
-    return out, native_own, native_frozen
+    return out, native_own, native_frozen, dropped
 
 
 def report(rows):
@@ -328,9 +361,34 @@ def report(rows):
         print(f"  median within-group sd: {floor:.4f} nats/res"
               f"   (max {max(sds):.4f})")
 
-    gaps, nat_own, nat_frozen = _gaps(rows)
+    gaps, nat_own, nat_frozen, dropped = _gaps(rows)
     print(f"\nnative folds available for: {sorted(nat_own)}"
           f"   mutants comparable: {len(gaps)}")
+    if dropped:
+        # Printed, never silent: the reader has to see that the arm counts
+        # below are smaller than the number of folds the sweep paid for.
+        print(f"  collapsed {len(dropped)} duplicate sequence(s) -- an arm "
+              f"returned a sequence another arm had already produced, so the "
+              f"measurement is ONE measurement, not two:")
+        for d in dropped:
+            print(f"    {d['target_id']} k={d['k']} arm={d['arm']} "
+                  f"== arm={d['duplicate_of']}")
+    by_arm = {}
+    for g in gaps:
+        if g.get("arm"):
+            by_arm.setdefault(g["arm"], []).append(g["gap"])
+    if by_arm:
+        print("\nby arm (after collapsing duplicates):")
+        for a in ("opt", "pos", "any"):
+            if a not in by_arm:
+                continue
+            s = sign_test(by_arm[a])
+            print(f"  {a:4s} n={len(by_arm[a]):3d}  positive={s['pos']}/"
+                  f"{s['n']}  p={s['p']:.4g}  "
+                  f"mean={st.mean(by_arm[a]):+.4f}")
+        print("  `opt` is the decision-relevant arm. If `any` shows the same "
+              "bias, the pose absorbs edits in general and the effect is not a "
+              "selection artefact of the argmax.")
     if not gaps:
         print("  GATE: no mutant has a cached native fold for its target, so "
               "no double difference is computable.")
@@ -480,13 +538,39 @@ def selftest():
         {"target_id": "u", "is_native": False, "k": 1, "in_window": True,
          "pll_own_median": -1.0, "pll_frozen": -0.5, "pll_own_sd": 0.01},
     ]
-    g, _, _ = _gaps(rows)
+    g, _, _, drp = _gaps(rows)
+    eq("rows with no seq are never merged", len(g), 2)
+    eq("nothing is collapsed without evidence", drp, [])
     eq("mutants without a native fold are dropped",
        sorted({x["target_id"] for x in g}), ["t"])
     eq("crystal-vs-Boltz offset cancels",
        round(next(x["gap"] for x in g if x["k"] == 1), 6), 0.0)
     eq("real coupling survives",
        round(next(x["gap"] for x in g if x["k"] == 2), 6), -0.2)
+
+    # A COLLIDING ARM MUST NOT BE COUNTED TWICE. `pos` returns the argmax
+    # whenever the window has exactly k positive-gain positions, and the fold is
+    # cached by sequence, so the second row is a bitwise copy. Two copies of one
+    # measurement in a binomial test is a manufactured n.
+    dup_rows = [
+        {"target_id": "t", "is_native": True, "k": 0, "seq": "AAAA",
+         "pll_own_median": -1.5, "pll_frozen": -0.5, "pll_own_sd": 0.01},
+        {"target_id": "t", "is_native": False, "k": 3, "in_window": True,
+         "arm": "pos", "seq": "AGGG",
+         "pll_own_median": -1.9, "pll_frozen": -0.7, "pll_own_sd": 0.01},
+        {"target_id": "t", "is_native": False, "k": 3, "in_window": True,
+         "arm": "opt", "seq": "AGGG",
+         "pll_own_median": -1.9, "pll_frozen": -0.7, "pll_own_sd": 0.01},
+        {"target_id": "t", "is_native": False, "k": 3, "in_window": True,
+         "arm": "any", "seq": "AHIE",
+         "pll_own_median": -1.8, "pll_frozen": -0.7, "pll_own_sd": 0.01},
+    ]
+    g2, _, _, drp2 = _gaps(dup_rows)
+    eq("an identical sequence is one measurement, not two", len(g2), 2)
+    eq("the collapse is reported", len(drp2), 1)
+    eq("the dropped row is the non-opt arm", drp2[0]["arm"], "pos")
+    eq("`opt` is the arm kept",
+       sorted(x["arm"] for x in g2), ["any", "opt"])
 
     print("statistics")
     eq("sign test, all positive", sign_test([1, 2, 3])["p"], 0.25)
