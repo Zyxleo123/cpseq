@@ -147,6 +147,21 @@ def load(path, arm=None, exclude=None):
             "norm_regret": (float(it["regret"]) / gain) if gain > 1e-9 else 0.0,
             "gain": gain,
             "solved": 1.0 if float(it["regret"]) <= 0.0 else 0.0,
+            # Regret is `best - optimum` and CANNOT be negative against a bar
+            # the arm is confined to. A negative value means the arm reached
+            # something the optimum excluded -- measured on 1t5z and 2hwl, where
+            # the LLM edited an OFF-INTERFACE position while the optimum was
+            # constrained to the interface to match the EA's action space
+            # (`_point_mutate` draws from `_iface_positions`, `parse_many`
+            # accepts any position). Flagged rather than averaged, because a
+            # negative mean regret silently reported as an improvement is how
+            # this went unnoticed for six targets.
+            "regret_negative": float(it["regret"]) < -1e-9,
+            "free_fitness": o.get("free_fitness"),
+            "regret_vs_free": (
+                None if o.get("free_fitness") is None
+                or it.get("best_recovered") is None
+                else float(it["best_recovered"]) - float(o["free_fitness"])),
             "n_evals": it.get("n_evals"),
             "n_gen_run": it.get("n_gen_run"),
             "evals_to_optimum": it.get("evals_to_optimum"),
@@ -349,6 +364,17 @@ def compare(path_a, path_b, label_a="A", label_b="B", arm=None, exclude=None,
     if not shared:
         print(f"GATE: no shared targets between {path_a} and {path_b}")
         return None
+    for lab, d in ((label_a, A), (label_b, B)):
+        neg = [k for k in shared if d[k].get("regret_negative")]
+        if neg:
+            print(f"\n  !! {lab}: NEGATIVE regret on {len(neg)} target(s) "
+                  f"({', '.join(neg)}).\n"
+                  f"     That arm reached a genome the optimum EXCLUDED, so this "
+                  f"bar is not valid for it:\n"
+                  f"     the optimum is constrained to the interface to match "
+                  f"the EA's action space, while\n"
+                  f"     the LLM arm may edit any position. Use regret_vs_free "
+                  f"for a cross-arm claim.")
     better = [k for k in shared if B[k]["regret"] < A[k]["regret"] - 1e-12]
     worse = [k for k in shared if B[k]["regret"] > A[k]["regret"] + 1e-12]
     moved = len(better) + len(worse)

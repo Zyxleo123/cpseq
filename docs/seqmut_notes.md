@@ -1835,6 +1835,161 @@ was deliberately NOT added to the paid run mid-flight, since introducing
 untested-in-production code into a run that costs money changes two things at
 once.
 
+## RESULT: the LLM optimizes the table reliably — and that is why it should stop doing it
+
+### The measurement (job 120763, partial: 6 of 29 targets)
+
+Paired on the 6 shared targets completed so far (`1ee5 1t3l 1t5z 2b1n 2f31
+2hwl`), same seed pool, same `k_mut=2`, same `max_evals=900`:
+
+```
+  arm                  regret vs IFACE opt   regret vs FREE opt   reached FREE opt
+  BEFORE prompt fix              +0.1043              +0.1146           1/6
+  AFTER  prompt fix              -0.0074              +0.0029           5/6
+  iter-ea control                +0.1512              +0.1614           0/6
+```
+
+**5 of 6 targets reach the exact unrestricted table optimum.** Supporting
+mechanism, all independently measured:
+
+* novel children delivered per generation **5.8 → 11.1** of 12 requested
+* duplicate proposals **68.5% → 9.0%** of slots (`1ee5`)
+* distinct evaluations **515 → 899** per target (the 900 cap now binds)
+* matched-budget regret at the first 400 evals **0.0814 → 0.0068**, so this is
+  proposal quality and not only budget consumption
+* cost **$0.0622 → $0.0886** per target (the richer brief is not free)
+
+### A CONFOUND found while writing this up: the arms do not share an action space
+
+`regret vs IFACE opt` above is **−0.0074, i.e. NEGATIVE**, and regret is
+`best − optimum`, so it cannot be below zero. The cause is not a code bug:
+
+* `_point_mutate` draws new positions only from `_iface_positions(t)`, and the
+  KNOWN OPTIMUM was deliberately constrained to that same set — the earlier
+  "whose optimum?" fix, so the EA is not blamed for positions it is forbidden to
+  touch.
+* `parse_many` accepts **any** position `0 <= pos < L`. The LLM arm was never
+  confined to the interface.
+
+So on two targets the LLM edited off-interface and beat the bar it was graded
+against:
+
+```
+  1t5z  LLM (5:Q,10:I)   pos 5 off-iface   iface opt (0:M,10:I)  free opt (5:K,10:I)
+  2hwl  LLM (2:G,14:G)   pos 14 off-iface  iface opt (2:G,23:M)  free opt (2:G,14:G)
+```
+
+On `2hwl` the LLM found the **true unrestricted optimum**. Under `--pll-scope
+all` the score averages over every position, so a non-contacting residue really
+can improve it — the EA is simply not allowed to try.
+
+**Consequences, stated rather than smoothed:**
+
+1. Cross-arm regret against the interface-constrained optimum is **invalid for
+   the LLM arm**. Every LLM number in this section is also reported against the
+   FREE optimum, which is the only bar valid for both arms.
+2. Part of the LLM's advantage is a **larger action space**, not a better
+   operator. That is a confound in any "operator quality" claim and it is not
+   fixed by this run. Fixing it means matching the action spaces — either reject
+   off-iface LLM proposals, or let the EA draw from all positions (which would
+   invalidate the recorded `iter-ea` baseline). Neither is done yet.
+3. A negative mean regret must never be averaged into a summary silently; it is
+   a signal that the bar and the arm disagree.
+
+### The direction going forward: the table owns binding, the LLM owns the rest
+
+The result above is the reason to **stop using the LLM as a binding search
+operator**, not a reason to continue. The logic is short:
+
+* `pll_bg` is a mean of independent per-position terms, so its optimum under a
+  Hamming budget is `TargetPSSM.best_subs` — exact, deterministic, ~1 s table
+  build then ~14 µs per sequence, and asserted against brute force.
+* On the same objective the LLM costs **$0.0886/target** and reaches that
+  optimum on 5/6. The closed form reaches it on 6/6 for free.
+* **For unconstrained `pll_bg`, an LLM search arm is indefensible.** Any writeup
+  that omits this sentence reads as motivated.
+
+What the LLM result *does* buy is trust: an operator that reliably lands on the
+table optimum can be relied on not to wreck binding when asked to do something
+else at the same time.
+
+**The architecture that follows.** `pll_bg` is a *single-objective* oracle,
+graded on one axis (pose-conditioned binding preference: ρ ≈ 0.35 on 2501
+SKEMPI mutations, 13/13 on the leak-free CPSet pairs, specificity confirmed by
+the wrong-receptor control). Real design is multi-objective, and the other axes
+— synthesizability, aggregation, oxidation and deamidation liabilities, protease
+susceptibility, charge and solubility, macrocyclization compatibility,
+selectivity — have **no scorer anywhere in this pipeline**. They are tacit,
+open-ended and target-dependent, which is exactly why no solver exists to beat.
+
+So: **the table maximises binding; the LLM balances everything else.** The LLM's
+contribution is not search — it is *supplying the constraint set*, the part
+nobody has written down.
+
+**The indifference band makes this cost-free rather than a trade-off.** The
+metric's own stated resolution is 0.05 nats/res ("a difference of 0.05 is
+real"). Within that band binding is a TIE, so anything the LLM optimises inside
+it is bought at **zero binding cost by construction**.
+
+Feasibility, measured from the sampled genomes already on disk (a LOWER bound —
+only sets the search happened to visit, e.g. ~3.3k of ~72k possible 2-sub sets
+on `1ee5`):
+
+```
+  band = measured genomes within 0.05 nats/res of the best measured
+  median 4-5 candidates, range 1-19 over 26 targets
+  2f31 and 3ayu have band = 1: NO choice at all
+```
+
+**The band is too tight at `k_mut=2`**, and that is a design consequence, not a
+disappointment: two substitutions is a budget almost entirely spent on binding.
+The architecture wants a larger edit budget, and the argument is clean —
+
+* the table solves binding **exactly for any k** (top-k per-position gains,
+  O(L·20) regardless);
+* the number of binding-equivalent sequences grows combinatorially with k;
+* so larger k gives the LLM real room *while binding stays exactly optimised*;
+* and search gets exponentially harder as k grows while the closed form does
+  not move, which is itself the argument for the table owning that axis.
+
+`k_mut = 4-6` is where this architecture lives. Note the band must be computed
+over the FREE action space (all positions), not the interface — see the confound
+above.
+
+**The validation experiment, and its nulls.** Pick the band from the table, then
+compare *selectors within it*, so binding cost is ≤0.05 nats/res by
+construction:
+
+| arm | what it tests |
+|---|---|
+| table argmax | what you would ship today |
+| random pick in band | is the LLM better than chance? |
+| 5-line heuristic (avoid Cys/Met, charge window) | is it better than the rule you would write in 5 minutes? |
+| LLM pick | the claim |
+
+Graded on a **computable developability panel the LLM is never shown**: net
+charge at pH 7.4, GRAVY, longest hydrophobic run, Cys/Met/Trp counts, NG/NS
+deamidation motifs, DP/DG degradation motifs, trypsin/chymotrypsin site counts,
+pI. Sequence-only, no new dependencies.
+
+Letting the model reason in language and grading it on metrics it was not told
+about is what keeps this non-circular. **The moment "minimize GRAVY" enters the
+prompt, a solver beats it again** — that is the same trap as the credit table.
+
+Cost: CPU for band and panel, ~$0.002/target for selection (~$0.06 for 29
+targets), **no GPU**.
+
+**Two risks to keep on the record:**
+
+1. **Recall, not judgment.** These heuristics are in the literature, so the
+   model may be reciting them rather than exercising tacit judgment. The
+   5-line-heuristic arm is the control that decides it: if a trivial rule
+   matches the LLM, the LLM adds nothing and that is the finding.
+2. **The panel is proxies, not measurements.** The defensible claim is "tacit
+   judgment aligns with standard computable developability heuristics at zero
+   binding cost" — not "better molecules". Upgrading that needs wet-lab data
+   this project does not have.
+
 ### Files
 
 ```
