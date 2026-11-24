@@ -1146,16 +1146,30 @@ def _probe_call_cost(llm_by_effort, efforts, targets, args) -> int:
         return 1
     t = targets[0]
     win = {"a": 0, "b": max(0, t.length - 1), "retention": 1.0, "clean": True}
-    # A brief of realistic SIZE, since input tokens are most of the cost: a
-    # full-looking elite block, failure memory and measured list, not an empty
-    # generation-1 brief that would price the run too low.
+    # A brief at its LARGEST, not its average. The measured list grows every
+    # generation and is the biggest part of the prompt, so a brief priced early
+    # in a run under-prices the run -- and under-pricing is the direction that
+    # hurts: an exceeded cap does not stop the search, `llm_offspring` quietly
+    # substitutes random-EA children for the rest of it. Sizing the list at
+    # --max-evals makes the printed $/call a late-run CEILING, so the affordable
+    # generation count that follows is conservative.
     elite = [{"subs": ((i % t.length, "W"),), "recovered": -1.5 - 0.01 * i,
               "sem": 0.0, "obs": [-1.5], "gen": 1} for i in range(12)]
-    measured = [S.subs_key([(i % t.length, a)])
-                for i, a in enumerate(AA20 * 8)]
+    n_meas = max(1, int(args.max_evals or 900))
+    rng = random.Random(0)
+    measured, seen = [], set()
+    while len(measured) < n_meas and len(seen) < 20 * t.length * t.length:
+        g = _norm([(rng.randrange(t.length), rng.choice(AA20))
+                   for _ in range(rng.randint(1, max(1, args.k_mut)))])
+        k = S.subs_key(g)
+        if k in seen:
+            continue
+        seen.add(k)
+        measured.append(k)
     rec_ctx = S.receptor_context(t)
-    print(f"[probe] pricing on {t.target_id} (L={t.length}), m_off={args.m_off}",
-          flush=True)
+    print(f"[probe] pricing on {t.target_id} (L={t.length}), m_off={args.m_off}, "
+          f"measured list sized at {len(measured)} (a LATE-run brief, so the "
+          f"$/call below is a ceiling)", flush=True)
     rows = []
     for effort, arms_here in efforts.items():
         llm = llm_by_effort[effort]
