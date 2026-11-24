@@ -151,6 +151,19 @@ def load(path, arm=None, exclude=None):
             "n_gen_run": it.get("n_gen_run"),
             "evals_to_optimum": it.get("evals_to_optimum"),
             "action_space_binds": bool(o.get("free_minus_constrained")),
+            # The MECHANISM columns. A paired regret difference says an arm did
+            # better; these say whether an operator did it. `dup_frac` is
+            # duplicates as a share of proposal SLOTS -- slots are
+            # llm_calls * m_off, because proposals arrive m_off per CALL and the
+            # re-ask fires most generations, so dividing by generations
+            # overstates the denominator and understates the waste (the
+            # "34-45%" in the notes was really 57.6%).
+            "llm_calls": it.get("llm_calls") or 0,
+            "n_dup_proposed": it.get("n_dup_proposed") or 0,
+            "llm_cost_usd": float(it.get("llm_cost_usd") or 0.0),
+            "fallback_gens": it.get("fallback_gens") or 0,
+            "effort": it.get("effort"),
+            "effort_sent": it.get("effort_sent"),
         })
     return out
 
@@ -315,7 +328,8 @@ def report(path, out_json=None, thresh=DISCRIMINATING_REGRET, n_perm=20000,
     return 0
 
 
-def compare(path_a, path_b, label_a="A", label_b="B", arm=None, exclude=None):
+def compare(path_a, path_b, label_a="A", label_b="B", arm=None, exclude=None,
+            m_off=12, max_evals=0):
     """PAIRED comparison of two runs over their SHARED targets.
 
     Written for one question: is a solve rate below 100% a BUDGET limit, a
@@ -351,14 +365,32 @@ def compare(path_a, path_b, label_a="A", label_b="B", arm=None, exclude=None):
         g = [d[k] for k in shared]
         ns = int(sum(r["solved"] for r in g))
         ev = [r["n_evals"] for r in g if r["n_evals"] is not None]
+        slots = sum(r["llm_calls"] for r in g) * m_off
+        dup = sum(r["n_dup_proposed"] for r in g)
         out[lab] = {"solved": ns, "solved_frac": ns / len(g),
                     "mean_regret": st.mean(r["regret"] for r in g),
                     "mean_norm_regret": st.mean(r["norm_regret"] for r in g),
-                    "mean_evals": st.mean(ev) if ev else None}
+                    "mean_evals": st.mean(ev) if ev else None,
+                    "mean_calls": st.mean(r["llm_calls"] for r in g),
+                    "dup_slots": slots, "n_dup": dup,
+                    "dup_frac": (dup / slots) if slots else None,
+                    "total_cost_usd": round(sum(r["llm_cost_usd"] for r in g), 4),
+                    "n_at_eval_cap": sum(1 for r in g
+                                         if max_evals and r["n_evals"]
+                                         and r["n_evals"] >= max_evals)}
         print(f"  {lab:24s} solved {ns}/{len(g)} = {ns/len(g):4.0%}   "
               f"mean regret {out[lab]['mean_regret']:.4f}   "
               f"mean normalised {out[lab]['mean_norm_regret']:.3f}   "
               f"mean evals {out[lab]['mean_evals'] or 0:.0f}")
+        if slots:
+            print(f"  {'':24s} duplicates {dup}/{slots} slots = "
+                  f"{100 * dup / slots:.1f}%   mean calls "
+                  f"{out[lab]['mean_calls']:.0f}   "
+                  f"${out[lab]['total_cost_usd']:.2f}")
+        if out[lab]["n_at_eval_cap"]:
+            print(f"  {'':24s} !! {out[lab]['n_at_eval_cap']}/{len(g)} target(s) "
+                  f"REACHED the {max_evals}-eval cap -- for those the budget "
+                  f"bound, not the operator")
     print(f"  moved: {len(better)} better, {len(worse)} worse, "
           f"{out['n_unchanged']} bit-identical"
           + (f"   sign test p({label_b} better than {label_a}) = {p:.4f}"
