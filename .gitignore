@@ -25,7 +25,11 @@ env/
 .idea/
 .vscode/
 
-# Local scratch (compute outputs live under /zfsauton/scratch, never in-repo)
+# Local scratch (compute outputs live under /zfsauton/scratch, never in-repo).
+# One deliberate carve-out: docs/figs/ holds the committed publication figure
+# set, so a reader of docs/binding_metric_results.md sees the evidence without
+# scratch access. Those are redrawable from the pushed code plus the saved rows
+# -- see docs/figs/README.md. Nothing else rendered belongs in the repo.
 *.out
 *.log
 
