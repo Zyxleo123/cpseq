@@ -1236,22 +1236,47 @@ What would separate them, in order of cost:
 
 #### The credits ran out mid-run — and the failure mode is the dangerous one
 
+**RESOLVED as of 2026-11-23: credits were topped up (+$200) and a probe returns
+`StepStatus.OK`. The LLM arm is runnable again.** The incident is recorded
+because the failure mode is permanent even though the outage was not.
+
 The last three targets processed (alphabetically) degraded: `6g86` took 12
 errors of 80, then `6qg8` and `6seo` errored on **all 80 calls at $0.00**. A
-direct probe returns `http_429: You have no credits remaining.` This is the
-OpenAI account's billing limit, **not** this project's `--max-spend-usd` ledger
-(which stopped at $1.66 of $3.00).
+probe at the time returned `http_429: You have no credits remaining.` That was
+the OpenAI account's billing limit, **not** this project's `--max-spend-usd`
+ledger, which stopped at $1.66 of $3.00.
 
 It matters because `llm_offspring` falls back to a **random-EA child** on error.
 An unfunded LLM arm therefore writes rows, gets graded, and converges on its own
 EA control — which is indistinguishable from the real "separable, saturated"
-finding. `pll_llm_validity.py` exists for exactly this and flagged it
-(`VALID`/`PARTIAL`/`INVALID_TAIL`); it is wired into `s4_lnr_pll_regret.sbatch`
-as a gate, prints the API's own error text, and emits a ready-to-paste
-`--exclude` list. **Add credits before any further LLM arm.**
+finding. It fails *toward a plausible conclusion*, which is why it needs a gate
+rather than vigilance. `pll_llm_validity.py` exists for exactly this and flagged
+it (`VALID`/`PARTIAL`/`INVALID_TAIL`); it is wired into
+`s4_lnr_pll_regret.sbatch`, prints the API's own error text, and emits a
+ready-to-paste `--exclude` list. Rows now also persist the first error string
+(`iter.llm_error_detail`), so diagnosing the next one needs no live probe.
 
-Measured cost, for planning: **$0.0615/target** at `n_gen=80` (152 calls/target,
-~$0.0004/call) — so 29 targets is ~$1.78 and all 79 would be ~$4.86.
+Read the three signatures apart:
+
+| signature | meaning |
+|---|---|
+| `error:N`, `$0.0000` | the API refused — quota, key, rate limit. Account-level. |
+| `budget_cap` | this project's ledger, a **per-run** budget (one ledger before the target loop), not per-target |
+| zero usable successes | that target carries no LLM signal at all; exclude it. The gate keys on successes, not call count |
+
+#### Budget, measured — price a run before submitting it
+
+**$0.0615/target** at `n_gen=80` (~152 calls/target, ~$0.0004/call). So the
+29-target subset is **~$1.78**, and all 79 would be ~$4.86. Each seed replicate
+multiplies that.
+
+The standing convention is a **$3 ceiling that will not be reached**, ~$1.70
+actual, per experiment — a larger account balance is not a larger per-run
+allowance, and a cap that *is* reached silently corrupts the tail (above). The
+lever that has actually paid here is experiment design, not spend: restricting
+to the 29 discriminating targets captured ~all the available signal for ~37% of
+the cost. **The pll evaluator and the EA arm are CPU-only and free**, so
+eval-matched and null-scorer controls should never be waiting on budget.
 
 #### Also settled: the scope question is NOT low-stakes
 
@@ -1273,9 +1298,31 @@ on `lov4` has no pytest).
 
 **Read "RESULT: the LLM arm ran" immediately above this section first.** In
 short: the LLM arm does not separate from random EA (p = 0.21 on regret, 0.11 on
-exact optima, n = 27), it cannot be budget-matched because the EA's operator
-saturates, and **the OpenAI account has no credits left**, which cost the last
-two targets and blocks any rerun.
+exact optima, n = 27), and it cannot be budget-matched because the EA's operator
+saturates at ~386 distinct proposals. Credits ran out during 119773 and cost two
+targets; **they have since been topped up and the API is working**, so a rerun
+is possible — run the funding gate on anything it produces.
+
+#### The next experiments, cheapest first
+
+Priority order, with the budget convention above (~$3 ceiling per experiment,
+price it before submitting):
+
+1. **FREE — give the EA a diversity-aware operator.** It currently loses partly
+   by failing to spend its budget, so this is the honest control, not a
+   courtesy. Reject known genomes before scoring; scale `k_mut` with length
+   (open item 4, which the 1/L dilution already argued for). CPU only.
+2. **FREE — decide the scope**, or at least stop reporting `all` as if it
+   transferred. `window` is a 35–42% different objective (above).
+3. **~$1.78/replicate — replicate the LLM arm over k seeds** on the same 29
+   targets. The pll evaluator is deterministic and the EA is seeded, so the LLM
+   is the only stochastic component; k seeds turn one noisy draw per target into
+   a mean. This is the only route to power, since the remaining 50 targets sit
+   at regret 0 where the LLM can only tie. Two or three replicates is the
+   sensible first step, not ten.
+4. **~$0.12 — refill `6qg8` and `6seo`**, the two targets the outage cost.
+   Delete their `iter-llm` rows first (the run SKIPS rows already present) or
+   they will be treated as done.
 
 #### What is done and believed
 
