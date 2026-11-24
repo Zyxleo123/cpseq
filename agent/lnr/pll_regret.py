@@ -500,6 +500,83 @@ def compare_arms(path, arm_a="iter-ea", arm_b="iter-llm", exclude=None,
     return out
 
 
+def novelty(traj_path, exclude=None) -> dict:
+    """PROPOSAL NOVELTY per arm, read from the trajectory.
+
+    READ `dup_frac` PER ARM, NEVER ACROSS ARMS. The arms are not measured at
+    the same point and the asymmetry is structural:
+
+      * `llm_offspring` DROPS proposals that repeat a known genome before it
+        returns, so an LLM arm's returned children are novel by construction --
+        `dup_frac` is ~0 whatever the model proposed. It was ~0.7% before the
+        complete-history fix and ~0.6% after, which says nothing about the fix.
+        An LLM arm pays for its duplicates in RE-ASKS (extra calls, extra
+        dollars) and in generations that return fewer than `m_off` children;
+        that cost lives in `iter.n_dup_proposed` and `iter.llm_calls`.
+      * `ea_offspring` gives up after 8 colliding tries and returns the
+        duplicate anyway, so its waste DOES land here.
+
+    The quantity that IS comparable is `novel_per_gen`: novel children actually
+    delivered per generation. It is what decides how much of an evaluation
+    budget an operator can spend, and it is measured identically for every arm.
+
+    Seed generations are skipped: the seed pool is shared by construction, so
+    counting it would dilute every arm by the same amount and flatter whichever
+    arm ran fewest generations.
+    """
+    drop = set(exclude or ())
+    agg: dict = {}
+    for line in Path(traj_path).read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if d.get("phase") == "seed" or d.get("n_proposed") is None:
+            continue
+        if d.get("target_id") in drop:
+            continue
+        a = agg.setdefault(d.get("arm"), {"proposed": 0, "novel": 0,
+                                          "gens": 0, "targets": set()})
+        a["proposed"] += int(d["n_proposed"])
+        a["novel"] += int(d.get("n_new") or 0)
+        a["gens"] += 1
+        a["targets"].add(d.get("target_id"))
+    out = {}
+    for arm, a in sorted(agg.items()):
+        p = a["proposed"]
+        out[arm] = {"proposed": p, "novel": a["novel"], "gens": a["gens"],
+                    "dup_frac": ((p - a["novel"]) / p) if p else None,
+                    # the cross-arm number: novel children delivered per
+                    # generation, measured identically for every operator
+                    "novel_per_gen": (a["novel"] / a["gens"]) if a["gens"] else None,
+                    "n_targets": len(a["targets"])}
+    return out
+
+
+def print_novelty(traj_path, exclude=None):
+    nov = novelty(traj_path, exclude=exclude)
+    if not nov:
+        print(f"\nNOVELTY: no usable generations in {traj_path}")
+        return nov
+    print(f"\nPROPOSAL NOVELTY (from the trajectory)")
+    print(f"  {'arm':14s} {'targets':>7s} {'gens':>6s} {'proposed':>9s} "
+          f"{'novel':>8s} {'dup%':>7s} {'novel/gen':>10s}")
+    for arm, v in nov.items():
+        print(f"  {arm:14s} {v['n_targets']:7d} {v['gens']:6d} "
+              f"{v['proposed']:9d} {v['novel']:8d} "
+              f"{100 * v['dup_frac']:6.1f}% {v['novel_per_gen']:10.1f}")
+    print("  novel/gen IS comparable across arms -- it is what decides how much "
+          "of an\n  evaluation budget an operator can spend.")
+    print("  dup% IS NOT comparable across arms: llm_offspring drops repeats "
+          "BEFORE\n  returning, so an LLM arm reads ~0% whatever it proposed "
+          "(its duplicate cost\n  is re-asks, in iter.n_dup_proposed and "
+          "llm_calls), while ea_offspring\n  returns the duplicate and is "
+          "charged for it here.")
+    return nov
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--rows", required=True, help="seqmut_iter_pll_rows.jsonl")
@@ -524,6 +601,10 @@ def main() -> int:
                          f"({', '.join(sorted(ARTIFACT_TARGETS))}): peptides "
                          f"that are expression tags, where there is no binding "
                          f"signal to recover")
+    ap.add_argument("--traj", default="",
+                    help="seqmut_iter_pll_traj.jsonl; adds the per-arm PROPOSAL "
+                         "NOVELTY table, the only duplicate metric that is fair "
+                         "to the EA arms (rows record dup only for LLM arms)")
     ap.add_argument("--compare-arms", default="",
                     help="two arms in THIS file to pair, as 'armA:armB' (e.g. "
                          "iter-ea:iter-llm). The matched-budget operator "
@@ -535,9 +616,12 @@ def main() -> int:
     rc = report(a.rows, out_json=(a.out_json or None), thresh=a.thresh,
                 n_perm=a.n_perm, max_evals=(a.max_evals or None),
                 arm=(a.arm or None), exclude=exclude)
+    if a.traj:
+        print_novelty(a.traj, exclude=exclude)
     if a.compare:
         compare(a.rows, a.compare, label_a=a.label, label_b=a.compare_label,
-                arm=(a.arm or None), exclude=exclude)
+                arm=(a.arm or None), exclude=exclude,
+                max_evals=(a.max_evals or 0))
     if a.compare_arms:
         if ":" not in a.compare_arms:
             raise SystemExit("--compare-arms wants 'armA:armB'")
