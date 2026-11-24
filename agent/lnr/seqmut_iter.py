@@ -592,7 +592,13 @@ def _tried_block(tried, units: str = "REU") -> str:
             f"({units}):\n  " + "; ".join(cells) + "\n\n")
 
 
-def _measured_block(keys, cap: int = 600) -> str:
+# Must stay AT OR ABOVE the job's --max-evals (900 for the pll job): see
+# `_measured_block`. Shared with `iter_brief`, which may only call the measured
+# list "COMPLETE" when it actually is.
+MEASURED_CAP = 1200
+
+
+def _measured_block(keys, cap: int = MEASURED_CAP) -> str:
     """The COMPLETE list of genomes already evaluated.
 
     Scores are deliberately absent: this block answers "has this been tried?",
@@ -600,6 +606,13 @@ def _measured_block(keys, cap: int = 600) -> str:
     and nothing more. Keeping fitness out of it means the block cannot be read
     as a per-position credit assignment -- that is a separate, deliberately
     unpulled lever (see docs/seqmut_notes.md, "the credit table").
+
+    `cap` must stay AT OR ABOVE `--max-evals` (900 in the pll job), or the block
+    silently stops being complete and the instruction that calls it complete
+    stops being true. Keys arrive best-first, so a truncation drops the WORST
+    ones -- precisely the genomes most likely to be re-proposed by a model that
+    can no longer see they were measured. The cost of the full list is input
+    tokens only, a few hundred against a ~2600-token brief.
     """
     keys = [k if k else "(none)" for k in keys]
     if not keys:
@@ -694,6 +707,13 @@ def iter_brief(t, window, k_mut, elite, m, gen, wt_ala=None, folded=False,
             f"{2 * noise_sd:.1f} {units} of each other are TIED, not ranked. Do not "
             f"chase a lead smaller than that; look for an edit that should be "
             f"clearly better for a structural reason.\n\n")
+    # Only claim completeness when the list really is complete -- an instruction
+    # to check an exhaustive list that was silently truncated is the same
+    # unsatisfiable contract the measured block was added to remove.
+    complete_note = (" That list is COMPLETE, so this is checkable: check it."
+                     if len(list(measured)) <= MEASURED_CAP
+                     else " That list is truncated, so also avoid obvious"
+                          " near-repeats of what is shown.")
     # The exploration floor. Pure local refinement around the incumbent is how the
     # loop stalled: >90% of offspring failed to beat the frontier they were shown
     # and the best genome was already found by generation 1 in 9 of 16 runs.
@@ -727,8 +747,7 @@ def iter_brief(t, window, k_mut, elite, m, gen, wt_ala=None, folded=False,
         f"score MORE NEGATIVE than the best above. Each set uses at most {k_mut} "
         f"substitution(s). {propose_mode}\n\n"
         f"Requirements for the {m} sets:\n"
-        f"- Every set must be absent from the measured list above. That list is "
-        f"COMPLETE, so this is checkable: check it.\n"
+        f"- Every set must be absent from the measured list above.{complete_note}\n"
         f"- At least {n_new_pos} of them must edit a position that is NOT on the "
         f"frontier. {pos_note}The frontier may be sitting on a measurement "
         f"artifact, so part of the budget has to test elsewhere -- prefer "

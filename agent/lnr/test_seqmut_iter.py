@@ -766,3 +766,24 @@ def test_finalist_row_persists_llm_raw_when_save_raw_is_set(patched):
                           traj, meta, 2, 1, 1.0, "placement_search")
     assert row.get("llm_raw"), "--save-raw collected replies but dropped them"
     assert any("<mut>" in r for r in row["llm_raw"])
+
+
+def test_measured_block_is_complete_at_the_jobs_real_eval_budget():
+    """The block's cap must cover `--max-evals`, or "COMPLETE" is a false claim.
+
+    The pll job runs at --max-evals 900. Keys arrive best-first, so truncation
+    drops the WORST ones -- exactly the genomes a model that can no longer see
+    them is most likely to re-propose, which is the duplicate bug this block
+    exists to fix.
+    """
+    keys = [f"{i % 20}:{I.AA20[i % 20]},{(i // 20) % 19}:W" for i in range(900)]
+    keys = list(dict.fromkeys(keys))
+    blk = I._measured_block(keys)
+    assert "truncated" not in blk
+    assert f"ALL {len(keys)} sets measured" in blk
+    for k in (keys[0], keys[len(keys) // 2], keys[-1]):
+        assert k in blk
+    # and when a pool DOES exceed the cap, the block says so rather than
+    # claiming completeness it cannot deliver
+    small = I._measured_block([f"{i}:W" for i in range(50)], cap=10)
+    assert "truncated" in small

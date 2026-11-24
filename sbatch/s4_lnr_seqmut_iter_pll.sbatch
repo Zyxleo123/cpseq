@@ -134,7 +134,17 @@ if ! "$PY" -c "import torch" 2>/dev/null; then echo "GATE: no torch in \$PY. Exi
 # ===========================================================================
 echo
 echo "=== GATE 1: pll selftest (determinism / sign / alignment / composition) ==="
+# Default: gate the same targets the search will run. Set
+# SEQITER_PLL_SELFTEST_TARGETS=ALL to gate the WHOLE manifest instead, which is
+# what a small search needs: the composition check is a FLEET-LEVEL claim with a
+# 60% floor, so on 2 targets it can only return 0%, 50% or 100% and a single
+# below-chance structure (2b1n, L=5) fails it on its own. That is the gate
+# having no power, not the metric being broken -- job 120647 failed exactly this
+# way. "ALL" maps to the empty target list, which every script here reads as
+# every target in the manifest.
 SELFTEST_TARGETS="${SEQITER_PLL_SELFTEST_TARGETS:-$TARGETS}"
+[ "$SELFTEST_TARGETS" = "ALL" ] && SELFTEST_TARGETS=""
+echo "selftest targets: '${SELFTEST_TARGETS:-<all in manifest>}'"
 if "$PY" "$AGENT/lnr/pll_inloop.py" --selftest \
     --manifest "$MAN" --pdb-dir "$PDB" \
     --targets "$SELFTEST_TARGETS" \

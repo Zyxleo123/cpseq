@@ -1704,5 +1704,49 @@ measured against an operator that cannot.
   sbatch/submit_lnr_seqmut_iter_pll.sh   the three new vars in the env file
 ```
 
-253 tests pass. The receptor context is verified aligned on 87/87 targets and
-the hi arm verified end-to-end on `3ayu` with the scripted backend (no spend).
+257 tests pass. The receptor context is verified aligned on **87/87 targets**
+(`receptor_contacts_by_position` returns None rather than a partial answer if
+the labels cannot be aligned to `rec_ca`, so a mislabelled partner cannot reach
+a brief).
+
+**Verification status of the plumbing (job 120648, RUN, no API spend).**
+`iter-ea,iter-llm,iter-llm-hi` on `3ayu` and `2b1n` through the real `pll`
+evaluator with `--backend scripted`. Measured:
+
+```
+  2b1n iter-ea      gens=6 evals=43  fallback=0  (control)
+  2b1n iter-llm     gens=6 evals=9   fallback=6  malformed:6
+  2b1n iter-llm-hi  gens=2 evals=8   fallback=2  malformed:2
+  3ayu iter-ea      gens=6 evals=44  fallback=0
+  3ayu iter-llm     gens=6 evals=11  fallback=6  malformed:6
+  3ayu iter-llm-hi  gens=2 evals=10  fallback=2  malformed:2
+  two ledgers created, cap split, printed per effort level
+```
+
+What it proves: the briefs build on real target data (receptor context, the
+complete measured list, the coverage block) with no exception; the hi arm
+honours **its own** `n_gen` (2 vs 6); the cap is split across two ledgers; and
+the gate discovers **both** LLM arms and returns `INVALID_TAIL` / exit 2 on each.
+
+What it does NOT prove: anything about proposal quality. `ScriptedClient` replies
+`<hold>`/`<tool>`, which do not parse as substitutions, so every generation fell
+back to a random-EA child — `fallback=100%` on 4/4 LLM rows, and the LLM arms
+got 8–11 evals against the EA's 43–44 because a fallback yields **one** child,
+not `m_off`. Their regret is correspondingly worse than the EA's. That is the
+scripted backend being detected, not a defect, and the gate refusing to grade it
+is the intended behaviour.
+
+**A gate trap this surfaced, worth keeping.** The first attempt (job 120647)
+failed GATE 1 on `composition: only 50% of targets beat their own scrambles
+(floor 60%)`. That was not the metric: the composition check is a *fleet-level*
+claim, and on 2 targets it can only return 0/50/100%, so one below-chance
+structure (`2b1n`, L=5, which the selftest itself calls "reported, not fatal"
+per target) fails it alone. On the full manifest the same check passes at
+**81/85 = 95%**. `SEQITER_PLL_SELFTEST_TARGETS=ALL` now gates the whole manifest
+while the search runs a subset — use it for any small-target run, or GATE 1
+will block the search for a reason that is about n, not about the data.
+
+So the first real measurement of these changes is still unrun, and the duplicate
+rate is the number to read first: it was **34–45%** before, and the complete
+measured list is the fix aimed squarely at it. `iter.n_dup_proposed` is already
+in every row, so the before/after is readable without new instrumentation.
