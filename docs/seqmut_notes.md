@@ -1690,6 +1690,81 @@ proposals out of ~980 — and that is a property of `_point_mutate`, not evidenc
 about the LLM. Until it exists, "the LLM proposes more distinct genomes" is
 measured against an operator that cannot.
 
+### PRICED (job 120665): the richer brief costs ~3x more, and `effort=high` is BROKEN at 6000 tokens
+
+The probe ran on `1ee5` (L=19, the longest peptide) with the measured list sized
+at `--max-evals 900`, so both figures are late-run ceilings:
+
+```
+  effort=low   status=OK      $0.001163/call  brief=11860c  parsed=12/12  effort_accepted=True
+  effort=high  status=ERROR   $0.003724/call  brief=11860c  parsed= 0/12  effort_accepted=True
+               detail=truncated:max_completion_tokens reasoning=6000
+  -> low:  $0.0337/generation over 29 targets; n_gen=80 projects to $2.70
+  -> high: cannot price (not OK) -- the probe refuses to recommend an n_gen
+```
+
+**`effort=high` returned ZERO proposals and still billed $0.0037/call.** At
+`LNR_MAX_TOKENS=6000` the model spends the entire completion budget on reasoning
+and emits no `<mut>` tag, so `parse_many` finds nothing and every generation
+falls back to a random-EA child. **That is the `iter-llm-hi` arm silently
+becoming the EA control** — the same failure as the unfunded arm, reached by a
+different route, and it would have produced "reasoning effort does not help"
+from an arm that never emitted a proposal. It cost **$0.004 to discover instead
+of $1.80**, which is the entire argument for pricing before submitting.
+
+If the hi arm is ever run it needs `LNR_MAX_TOKENS` well above the reasoning
+budget (16k–32k, measured not guessed) — and then the arithmetic has to be
+redone, because a *completed* high-effort call costs more than the truncated one
+priced here. At even $0.006/call the arm is **~$27** for 29 targets at
+`n_gen=80`, i.e. roughly 10x the standing per-experiment allowance. **The hi
+arm is not affordable at this model's pricing with this brief**; that is a
+budget fact, not a scientific one, and the cheap ways to change it are fewer
+targets, far fewer generations (which confounds effort with proposal count), or
+a cheaper model.
+
+**Cost of the low arm, from a local brief-size curve anchored on the measured
+point** (brief chars scale the price; the pool sweeps 20 → ~516 over a run, so
+the run cost is the average over the sweep, not the endpoint):
+
+```
+  pool    mean brief   est $/call   157 calls x 29 targets
+    20        4288c    $0.000421        $1.91
+   100        4794c    $0.000470        $2.14
+   250        5901c    $0.000579        $2.63
+   400        7114c    $0.000698        $3.18
+   516        8075c    $0.000792        $3.61
+   900       11180c    $0.001096        $4.99
+```
+
+So the low arm at `n_gen=80` on 29 targets is **~$2.2–2.7 actual** against the
+old $1.78 — the complete measured list is most of the brief, and it is not free.
+Submitted as job **120668** with a $3.00 cap and ONE ledger (one effort level
+means no split). That is inside the $3 ceiling but above the ~$1.70 norm, and
+the reason is the experiment itself: the brief had to get bigger for the
+duplicate fix to exist.
+
+### The baseline to beat (job 119773, recomputed)
+
+The duplicate rate quoted earlier as "34–45%" is **much worse** when computed
+against the right denominator. Proposals arrive `m_off` per **call**, and there
+were ~157 calls per target (≈2 per generation, because the re-ask fires almost
+every generation) — not 80:
+
+```
+  27 funded targets, m_off=12
+    llm_calls total      4244
+    proposal slots       50928   (= calls x m_off)
+    duplicates discarded 29342   = 57.6% of slots
+    -> of every 12-proposal batch, ~6.9 were already-measured repeats
+    mean regret 0.1361   exact optima 5/27   mean evals 516.0   $0.0615/target
+  EA on the same targets: mean regret 0.1435, mean evals 342.7
+```
+
+**57.6% of all proposals were discarded as repeats.** That is the number the
+complete measured list is aimed at, and `iter.n_dup_proposed / (llm_calls *
+m_off)` is the identical statistic to compute on the new rows — so the
+before/after is a like-for-like comparison, not a re-derivation.
+
 ### Files
 
 ```
